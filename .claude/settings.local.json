@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($b = Get-Content D:\\\\KYC\\\\mock_data\\\\bulk_customer.json -Raw | ConvertFrom-Json; $b.Count; $b[0] | ConvertTo-Json; $b | Select-Object customer_id, name, dob, father_name, occupation, income, expected_scenario, expected_decision | Format-Table -AutoSize | Out-String -Width 250)",
+      "PowerShell($s = Get-Content D:\\\\KYC\\\\mock_data\\\\sanction_list.json -Raw -Encoding UTF8 | ConvertFrom-Json; $s.Count; $s | Select-Object id, name, father_name, dob_range, list_source, risk_level | Format-Table -AutoSize | Out-String -Width 220)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python D:\\\\KYC\\\\graph.py)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python D:\\\\KYC\\\\graph.py 2>$null)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; Set-Location D:\\\\KYC; python bulk_acceptance_test.py 2>$null)",
+      "PowerShell(python -c \"import json; [json.load\\(open\\(f, encoding='utf-8'\\)\\) for f in ['D:/KYC/00_setup.ipynb','D:/KYC/01_demo.ipynb']]; print\\('notebooks: valid JSON'\\)\")"
+    ]
+  }
+}
