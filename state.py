@@ -482,8 +482,10 @@ def create_initial_state(
     source_of_funds: str,
     account_purpose: str,
     aadhaar_path: str,
-    pan_path: str,
     received_at: str,
+    pan_path: str          = "",   # kept optional for backward compatibility
+    aadhaar_back_path: str = "",   # back / address-QR side of the Aadhaar card
+    salary_slip_path: str  = "",   # optional income proof, verified by financial agent
 ) -> KYCState:
     """
     Builds the starting KYCState from what the customer typed on the form.
@@ -526,8 +528,10 @@ def create_initial_state(
         },
 
         documents = {
-            "aadhaar_card": aadhaar_path,
-            "pan_card"    : pan_path,
+            "aadhaar_card": aadhaar_path,        # front face — photo, name, DOB, number
+            "aadhaar_back": aadhaar_back_path,   # back — address + QR 'care_of'
+            "pan_card"    : pan_path,            # legacy / optional
+            "salary_slip" : salary_slip_path,    # optional income proof
         },
 
         audit_log = [

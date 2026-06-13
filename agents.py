@@ -44,13 +44,14 @@ from config import (
     INCOME_BANDS, OCCUPATION_INCOME_MAP,
     TEMP_FIRST_PASS, TEMP_REFINE_PASS, TEMP_EXPLANATION,
     REG_RBI_KYC, REG_PMLA, REG_PAN_AADHAAR,
-    WATCHLISTS,
+    WATCHLISTS, SALARY_MATCH_TOLERANCE,
 )
 from tools import (
     call_text_llm,
     call_llm_for_json,
     extract_text_from_image,
     parse_aadhaar_fields,
+    parse_salary_slip,
     compute_field_confidence,
     query_sanctions_db,
     check_exception_cache,
@@ -274,14 +275,24 @@ def data_extraction_agent(state: KYCState) -> KYCState:
     """
     refine_count = state.get("refine_count", 0)
     is_refinement = refine_count > 0
-    aadhaar_path  = state.get("documents", {}).get("aadhaar_card", "")
+    documents     = state.get("documents", {})
+    aadhaar_path  = documents.get("aadhaar_card", "")
+    aadhaar_back  = documents.get("aadhaar_back", "")
 
     directive   = "refinement_pass" if is_refinement else "standard_first_pass"
     temperature = TEMP_REFINE_PASS if is_refinement else TEMP_FIRST_PASS
     pass_label  = f"Pass {refine_count} (refinement)" if is_refinement else "Pass 0 (standard)"
 
-    # Step 1: OCR — extract raw text from Aadhaar image
-    ocr_text = extract_text_from_image(aadhaar_path)
+    # Step 1: OCR — extract raw text from the Aadhaar front image, then append
+    # the BACK image text if one was uploaded. The back of an Aadhaar carries
+    # the full address and the QR 'care_of' (father/husband) field, so feeding
+    # both faces to the LLM gives the refinement pass a real chance of finding
+    # the father's name. No back image → back_text stays empty → unchanged.
+    ocr_text  = extract_text_from_image(aadhaar_path)
+    back_text = extract_text_from_image(aadhaar_back) if aadhaar_back else ""
+    used_back = bool(back_text.strip())
+    if used_back:
+        ocr_text = (ocr_text + "\n" + back_text).strip()
 
     # Step 2: LLM — structure the OCR text into identity fields.
     # If OCR produced nothing (no image on disk — bulk profiles, laptop mode),
@@ -333,6 +344,8 @@ def data_extraction_agent(state: KYCState) -> KYCState:
     name_found    = extracted.get("full_name_english", "NOT FOUND")
     father_found  = extracted.get("father_name", None)
     father_note   = f"father_name: '{father_found}'" if father_found else "father_name: not found"
+    if used_back:
+        father_note += " (Aadhaar back side OCR'd)"
     if declared_fallback:
         father_note += " (declared-data fallback — document not readable)"
 
@@ -754,12 +767,47 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
     occ      = declared.get("occupation", "").lower().strip()
     source   = declared.get("source_of_funds", "").lower().strip()
     purpose  = declared.get("account_purpose", "").lower().strip()
+    salary_slip_path = state.get("documents", {}).get("salary_slip", "")
 
     income_band = _get_income_band(income)
     occ_band    = OCCUPATION_INCOME_MAP.get(occ, "entry")
 
     # ── Plausibility checks ───────────────────────────────────────────────
     anomaly_flags = []
+
+    # ── Salary-slip income verification ──────────────────────────────────
+    # Only runs when a slip was actually uploaded AND a figure could be read.
+    # Corroboration → informational note. A large mismatch → anomaly flag.
+    # (No slip on the canonical customers / bulk profiles, so this is inert
+    # there and the 20/20 acceptance test is unaffected.)
+    income_verification = None
+    if salary_slip_path and os.path.exists(salary_slip_path):
+        slip = parse_salary_slip(salary_slip_path)
+        slip_annual = slip.get("annual_income")
+        if slip.get("raw_found") and slip_annual:
+            variance = abs(slip_annual - income) / income if income > 0 else 1.0
+            if variance <= SALARY_MATCH_TOLERANCE:
+                income_verification = {
+                    "status":      "VERIFIED",
+                    "slip_annual": slip_annual,
+                    "variance":    round(variance, 3),
+                    "note": (
+                        f"Declared income ₹{income:,.0f} corroborated by salary slip "
+                        f"(₹{slip_annual:,.0f}/yr, {variance*100:.0f}% variance)."
+                    ),
+                }
+            else:
+                income_verification = {
+                    "status":      "DISCREPANCY",
+                    "slip_annual": slip_annual,
+                    "variance":    round(variance, 3),
+                    "note": (
+                        f"Declared income ₹{income:,.0f} but salary slip shows "
+                        f"₹{slip_annual:,.0f}/yr ({variance*100:.0f}% variance) — "
+                        f"income proof does not match declaration."
+                    ),
+                }
+                anomaly_flags.append(income_verification["note"])
 
     # Income vs occupation
     if income_band == "hni" and occ_band in ("entry", "middle"):
@@ -827,6 +875,7 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
         "plausibility":              plausibility,
         "anomaly_flags":             anomaly_flags,
         "requires_edd":              requires_edd,
+        "income_verification":       income_verification,
         "financial_risk_contribution": round(fin_risk, 3),
     }
 
@@ -837,6 +886,8 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
             f"occupation: '{declared.get('occupation')}', "
             f"plausibility: {plausibility['income_vs_occupation']}, "
             f"anomaly flags: {len(anomaly_flags)}"
+            + (f", salary slip: {income_verification['status']}"
+               if income_verification else "")
         ],
     }
 
@@ -1081,10 +1132,9 @@ def active_learning_cache_agent(state: KYCState) -> KYCState:
     }
 
     try:
-        from qdrant_client.models import PointStruct
-        from qdrant_client import QdrantClient
-        from config import QDRANT_URL
-        client = QdrantClient(url=QDRANT_URL)
+        # Reuse the shared embedded client from tools.py — local-mode Qdrant
+        # locks its storage folder, so a second QdrantClient would fail.
+        from tools import qdrant_client as client
         client.add(
             collection_name = "exception_cache",
             documents       = [f"{name} {dob} {officer_decision}"],

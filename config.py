@@ -31,9 +31,12 @@ TEMP_EXPLANATION  = 0.4   # some creativity — for NL explanation paragraph
 
 # ── Qdrant Vector Database ─────────────────────────────────────────────────
 # Stores the mock sanctions list as embeddings for semantic search.
-# Run with: docker run -p 6333:6333 qdrant/qdrant
+# Embedded local mode — data lives in a folder on disk, no Docker server.
+# NOTE: only ONE process can open this folder at a time (it takes a file
+# lock). Don't run setup / bulk_acceptance_test.py while app.py is running.
 
-QDRANT_URL             = "http://localhost:6333"
+QDRANT_LOCAL_PATH      = "./qdrant_local_db" # embedded storage folder
+QDRANT_URL             = "http://localhost:6333"  # only used if you switch back to server mode
 QDRANT_COLLECTION_NAME = "india_sanctions"   # created by your setup script
 QDRANT_TOP_K           = 5                   # return top 5 nearest matches
 
@@ -112,10 +115,20 @@ HNI_REQUIRED_DOCS = [
 # ── Document & Data Paths ─────────────────────────────────────────────────
 # Where files live on the AMD cloud notebook filesystem.
 
-UPLOAD_DIR          = "./uploads"             # customer-uploaded Aadhaar/PAN
+UPLOAD_DIR          = "./uploads"             # customer-uploaded Aadhaar/salary slip
 MOCK_DATA_DIR       = "./mock_data"           # your 20 test dossiers
 SANCTIONS_LIST_PATH = "./mock_data/sanctions_list.json"
 BULK_DOSSIERS_PATH  = "./mock_data/bulk_customers.json"
+
+# Human review inbox — cases routed to a human (ROUTE_TO_HUMAN) are written
+# here so a compliance officer can action them later. JSON on disk so the
+# queue survives app restarts (Streamlit session state does not).
+REVIEW_QUEUE_PATH   = "./review_queue/queue.json"
+
+# Salary-slip verification: how far the declared annual income may differ from
+# the figure parsed off an uploaded salary slip before it counts as a
+# discrepancy. 0.25 = ±25%.
+SALARY_MATCH_TOLERANCE = 0.25
 
 
 # ── Aadhaar / PAN Rules ───────────────────────────────────────────────────
@@ -148,7 +161,7 @@ if __name__ == "__main__":
     print("✅ config.py loaded successfully\n")
     print(f"  vLLM          : {VLLM_API_BASE}")
     print(f"  Model         : {MODEL_NAME}")
-    print(f"  Qdrant        : {QDRANT_URL} / {QDRANT_COLLECTION_NAME}")
+    print(f"  Qdrant        : {QDRANT_LOCAL_PATH} / {QDRANT_COLLECTION_NAME}")
     print(f"  Thresholds    : clear<{FUZZY_CLEAR_BELOW} | "
           f"ambiguous {FUZZY_AMBIGUOUS_LOW}–{FUZZY_AMBIGUOUS_HIGH} | "
           f"hit>{FUZZY_AMBIGUOUS_HIGH}")

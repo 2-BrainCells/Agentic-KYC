@@ -6,7 +6,14 @@
       "PowerShell($env:PYTHONIOENCODING='utf-8'; python D:\\\\KYC\\\\graph.py)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; python D:\\\\KYC\\\\graph.py 2>$null)",
       "PowerShell($env:PYTHONIOENCODING='utf-8'; Set-Location D:\\\\KYC; python bulk_acceptance_test.py 2>$null)",
-      "PowerShell(python -c \"import json; [json.load\\(open\\(f, encoding='utf-8'\\)\\) for f in ['D:/KYC/00_setup.ipynb','D:/KYC/01_demo.ipynb']]; print\\('notebooks: valid JSON'\\)\")"
+      "PowerShell(python -c \"import json; [json.load\\(open\\(f, encoding='utf-8'\\)\\) for f in ['D:/KYC/00_setup.ipynb','D:/KYC/01_demo.ipynb']]; print\\('notebooks: valid JSON'\\)\")",
+      "PowerShell(git *)",
+      "PowerShell($env:PYTHONUTF8='1'; python -c \"from tools import setup_sanctions_collection, query_sanctions_db; setup_sanctions_collection\\(\\); print\\(query_sanctions_db\\('Vikram Malhotra'\\)[:2]\\)\")",
+      "PowerShell($env:PYTHONUTF8='1'; python -c \"from tools import query_sanctions_db; import json; r = query_sanctions_db\\('Vikram Malhotra'\\); print\\(json.dumps\\(r[:2], indent=2, ensure_ascii=False\\)\\)\")",
+      "PowerShell($env:PYTHONUTF8='1'; python bulk_acceptance_test.py)",
+      "Bash(python bulk_acceptance_test.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u bulk_acceptance_test.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u graph.py)"
     ]
   }
 }

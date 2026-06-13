@@ -19,6 +19,7 @@ All functions have try/except — they NEVER crash the demo.
 On failure they return a safe default and log the error.
 """
 
+import atexit
 import json
 import re
 import os
@@ -27,14 +28,13 @@ import pytesseract
 from PIL                    import Image
 from openai                 import OpenAI
 from qdrant_client          import QdrantClient
-from qdrant_client.models   import Distance, VectorParams, PointStruct
 
 from config import (
     VLLM_API_BASE, VLLM_API_KEY, MODEL_NAME,
     VLLM_TIMEOUT, VLLM_MAX_TOKENS,
     TEMP_FIRST_PASS, TEMP_REFINE_PASS,
     TEMP_AGENT_LOGIC, TEMP_EXPLANATION,
-    QDRANT_URL, QDRANT_COLLECTION_NAME, QDRANT_TOP_K,
+    QDRANT_LOCAL_PATH, QDRANT_COLLECTION_NAME, QDRANT_TOP_K,
     FUZZY_CLEAR_BELOW, FUZZY_AMBIGUOUS_HIGH,
     SANCTIONS_LIST_PATH,
 )
@@ -50,8 +50,49 @@ llm_client = OpenAI(
     api_key  = VLLM_API_KEY,
 )
 
-# Qdrant — stores your mock sanctions list as embeddings
-qdrant_client = QdrantClient(url=QDRANT_URL)
+# Qdrant — stores your mock sanctions list as embeddings.
+# Embedded local mode: data lives in QDRANT_LOCAL_PATH on disk, no server.
+# Only one process can hold this folder at a time — every module must reuse
+# THIS client (import it from tools), never create a second QdrantClient.
+def _make_qdrant_client():
+    """
+    Open the embedded Qdrant store, but NEVER crash the app if we can't.
+
+    Local mode takes an EXCLUSIVE file lock on QDRANT_LOCAL_PATH. If a previous
+    Streamlit run, a leftover notebook kernel, or the setup script still holds
+    that folder, the constructor raises:
+        RuntimeError: Storage folder ... already accessed by another instance
+    That used to take down the whole app on import (the traceback the team
+    hit). Instead we fall back to an in-memory client: sanctions screening
+    still works, because query_sanctions_db() degrades to the deterministic
+    local_sanctions_scan() (it reads sanctions_list.json straight off disk).
+    The only thing lost is cross-session persistence of the exception cache —
+    acceptable for the demo. Close the other process to restore vector search.
+    """
+    try:
+        return QdrantClient(path=QDRANT_LOCAL_PATH)
+    except Exception as e:
+        print(f"[tools] ⚠ Embedded Qdrant at '{QDRANT_LOCAL_PATH}' is locked by "
+              f"another process ({e}).\n"
+              f"        Falling back to IN-MEMORY mode — sanctions screening "
+              f"still works via the local fuzzy scan.\n"
+              f"        To restore vector search: stop any other app.py / "
+              f"notebook kernel holding that folder, then restart.")
+        try:
+            return QdrantClient(location=":memory:")
+        except Exception as e2:
+            print(f"[tools] ⚠ In-memory Qdrant also failed: {e2} — "
+                  f"screening will use the on-disk fuzzy scan only.")
+            return None
+
+
+qdrant_client = _make_qdrant_client()
+
+# Close the embedded client cleanly at process exit — without this Python
+# prints a harmless-but-scary "__del__ ... sys.meta_path is None" traceback
+# during interpreter shutdown.
+if qdrant_client is not None:
+    atexit.register(qdrant_client.close)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,6 +350,72 @@ def compute_field_confidence(extracted: dict) -> dict:
     return confidence
 
 
+def parse_salary_slip(image_path: str) -> dict:
+    """
+    OCR a salary slip / income proof and pull out the pay figure, so the
+    financial agent can VERIFY the customer's declared income against an
+    actual document instead of just trusting the form.
+
+    Returns:
+        {
+          "monthly_income": float | None,   # best available monthly figure
+          "annual_income":  float | None,   # monthly × 12
+          "employer":       str   | None,
+          "raw_found":      bool,            # True only if a number was parsed
+        }
+
+    Safe on every failure path — no file, OCR empty, LLM down, bad number —
+    returns raw_found=False so the financial agent simply skips verification.
+    Only ever runs when a slip is actually uploaded, so it never changes the
+    behaviour of the canonical demo customers or the bulk profiles (no slip).
+    """
+    result = {"monthly_income": None, "annual_income": None,
+              "employer": None, "raw_found": False}
+    try:
+        if not image_path or not os.path.exists(image_path):
+            return result
+
+        text = extract_text_from_image(image_path)
+        if not text.strip():
+            return result
+
+        parsed = call_llm_for_json(
+            prompt=f"""You are reading an Indian salary slip / payslip extracted via OCR.
+Indian payslips state a MONTHLY figure ('Net Pay', 'Net Salary', 'Gross Salary').
+Numbers may use Indian formatting (e.g. 1,00,000). Return the plain number only.
+
+RAW OCR TEXT:
+--------------
+{text}
+--------------
+
+Return ONLY this JSON (use null if a value is not present):
+{{
+  "monthly_net_income":   number or null,
+  "monthly_gross_income": number or null,
+  "employer_name":        "string or null"
+}}""",
+            temperature=TEMP_FIRST_PASS,
+        )
+
+        monthly = parsed.get("monthly_gross_income") or parsed.get("monthly_net_income")
+        if monthly is not None:
+            try:
+                monthly = float(str(monthly).replace(",", "").strip())
+                if monthly > 0:
+                    result["monthly_income"] = monthly
+                    result["annual_income"]  = round(monthly * 12, 2)
+                    result["raw_found"]       = True
+            except (TypeError, ValueError):
+                pass
+        result["employer"] = parsed.get("employer_name")
+        return result
+
+    except Exception as e:
+        print(f"[tools] parse_salary_slip failed: {e}")
+        return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GROUP 3 — SANCTIONS TOOLS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -458,7 +565,9 @@ def query_sanctions_db(
         queries = [q for q in [name] + (name_variants or []) if q]
         matches = []
         for r in results:
-            entry = r.payload or {}
+            # fastembed's query() returns QueryResponse objects — the stored
+            # sanctions entry lives in .metadata (not .payload)
+            entry = r.metadata or {}
             score = max(
                 (_sanctions_match_score(q, entry.get("name", ""), entry.get("aliases"))
                  for q in queries),
@@ -579,7 +688,7 @@ def check_exception_cache(
             limit           = 1,
         )
         if results and results[0].score > 0.90:
-            return results[0].payload
+            return results[0].metadata
         return None
     except Exception:
         # Cache not set up yet — that is fine, return None
@@ -610,17 +719,15 @@ def setup_sanctions_collection() -> bool:
         with open(SANCTIONS_LIST_PATH, "r", encoding="utf-8") as f:
             sanctions = json.load(f)
 
-        # Delete + recreate the collection (idempotent — safe to re-run)
+        # Delete any existing collection (idempotent — safe to re-run).
+        # Do NOT pre-create it: qdrant_client.add() below creates the
+        # collection itself with the NAMED vector config that fastembed
+        # expects. A manually created unnamed 384-dim vector clashes with
+        # it and raises "Collection have incompatible vector params".
         existing = [c.name for c in qdrant_client.get_collections().collections]
         if QDRANT_COLLECTION_NAME in existing:
             qdrant_client.delete_collection(QDRANT_COLLECTION_NAME)
             print(f"[setup] Deleted existing collection '{QDRANT_COLLECTION_NAME}'")
-
-        # Create with fastembed — it handles vector size automatically
-        qdrant_client.create_collection(
-            collection_name = QDRANT_COLLECTION_NAME,
-            vectors_config  = VectorParams(size=384, distance=Distance.COSINE),
-        )
 
         # Ingest each sanctions entry
         # fastembed will embed the 'document' text for semantic search
@@ -701,7 +808,8 @@ if __name__ == "__main__":
                   f"run setup_sanctions_collection() in 00_setup.ipynb")
     except Exception as e:
         print(f"   ❌ Qdrant not reachable: {e}")
-        print("      Fix: docker run -p 6333:6333 qdrant/qdrant")
+        print(f"      Embedded mode — check that '{QDRANT_LOCAL_PATH}' is writable "
+              f"and no other process (app.py / a notebook kernel) has it open")
 
     print("\n" + "=" * 60)
     print("Run the fixes above, then re-run this file until all ✅")

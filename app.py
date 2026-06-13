@@ -3,10 +3,12 @@ app.py — Streamlit Demo Interface
 ===================================
 The face of the platform. Everything the judge sees.
 
-Three tabs:
-  1. KYC Pipeline  — upload Aadhaar, run the pipeline, see the decision
-  2. Bulk Import   — stress-test with 20 customers simultaneously
-  3. ROCm Telemetry — live AMD MI300X GPU + vLLM metrics
+Four tabs:
+  1. KYC Pipeline   — submit a customer, run the pipeline, see the decision
+  2. Bulk Import    — stress-test with 20 customers simultaneously
+  3. Review Queue   — compliance-officer inbox: every human-routed case
+                      (single + bulk) collects here, persisted to disk
+  4. ROCm Telemetry — live AMD MI300X GPU + vLLM metrics
 
 Run with:
     streamlit run app.py
@@ -16,18 +18,20 @@ Then open the URL shown in the terminal (usually http://localhost:8501)
 
 import os
 import json
-import time
-import tempfile
 from datetime import datetime
 
 import streamlit as st
 import pandas as pd
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-from graph      import build_graph, complete_case
-from state      import create_initial_state, Decision, Routing, CaseStatus
-from telemetry  import render_telemetry_tab
-from config     import BULK_DOSSIERS_PATH
+from graph        import build_graph, complete_case
+from state        import create_initial_state, Decision, Routing, CaseStatus
+from telemetry    import render_telemetry_tab
+from config       import BULK_DOSSIERS_PATH
+from review_queue import (
+    enqueue_case, list_cases, get_case, close_case, clear_queue, counts,
+    STATUS_PENDING, STATUS_CLOSED,
+)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -59,17 +63,15 @@ st.markdown("""
 
   /* AMD hardware badge */
   .amd-badge { background:#1a1a2e; border-left:4px solid #E84040;
-    border-radius:6px; padding:10px 16px; margin-bottom:16px; }
+    border-radius:6px; padding:10px 16px; margin-bottom:8px; }
+
+  /* Intro / how-it-works card */
+  .intro-card { background:#0f172a; border:1px solid #334155;
+    border-radius:8px; padding:14px 18px; margin-bottom:16px; }
 
   /* Audit log — monospace */
   .audit-line { font-family:monospace; font-size:0.82rem;
     color:#9CA3AF; margin:2px 0; }
-
-  /* Agent status dots */
-  .agent-dot-done    { color:#10B981; font-size:1.2rem; }
-  .agent-dot-flagged { color:#EF4444; font-size:1.2rem; }
-  .agent-dot-pending { color:#6B7280; font-size:1.2rem; }
-  .agent-dot-running { color:#F59E0B; font-size:1.2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -90,12 +92,11 @@ def get_graph():
 
 def init_state():
     defaults = {
-        "case_result":       None,   # final state from app.invoke()
-        "aadhaar_img_path":  None,   # path to uploaded Aadhaar image
-        "case_closed":       False,  # whether HITL has been completed
-        "closed_result":     None,   # result of complete_case()
-        "bulk_results":      [],     # list of bulk import results
-        "bulk_running":      False,  # is bulk import in progress
+        "case_result":      None,   # final state from app.invoke()
+        "aadhaar_img_path": None,   # path to uploaded Aadhaar front image
+        "queued_id":        None,   # customer_id if this case went to the queue
+        "bulk_results":     [],     # list of bulk import results
+        "bulk_queued":      0,      # how many bulk cases were sent to the queue
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -117,36 +118,24 @@ def save_upload(uploaded_file) -> str:
     return path
 
 
-def draw_aadhaar_overlay(
-    image_path:            str,
-    bounding_boxes:        dict,
-    low_confidence_fields: list,
-    field_confidence:      dict,
-) -> Image.Image:
-    """
-    Draws coloured bounding boxes on the Aadhaar card image.
-      Green  = high confidence field (≥ 0.90)
-      Amber  = medium confidence     (0.75 – 0.90)
-      Red    = low confidence / found only on refinement pass
-    """
+def draw_aadhaar_overlay(image_path, bounding_boxes, low_confidence_fields,
+                         field_confidence):
+    """Draws coloured field boxes on the Aadhaar image (green/amber by conf)."""
     try:
         img  = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(img)
-
         for field, box in bounding_boxes.items():
             conf = field_confidence.get(field, 0.0)
             if conf == 0.0:
-                continue                            # field not extracted — skip
+                continue
             if field in low_confidence_fields:
-                color, width = (255, 165, 0), 3    # amber
+                color, width = (255, 165, 0), 3
             elif conf >= 0.90:
-                color, width = (16, 185, 129), 2   # green
+                color, width = (16, 185, 129), 2
             else:
-                color, width = (245, 158, 11), 2   # yellow
-
+                color, width = (245, 158, 11), 2
             x, y, w, h = box["x"], box["y"], box["w"], box["h"]
             draw.rectangle([x, y, x + w, y + h], outline=color, width=width)
-
         return img
     except Exception:
         return None
@@ -162,42 +151,10 @@ def decision_badge(decision: str) -> str:
     return f'<span class="{cls}">{decision.replace("_", " ")}</span>'
 
 
-def agent_status_row(audit_log: list) -> None:
-    """
-    Reads the audit log and renders a coloured status dot for each agent.
-    Green = ran clean. Red = flagged. Grey = did not run.
-    """
-    agents = {
-        "Extraction":       ("extract",    "📄"),
-        "ID Verify":        ("ID Verify",  "🪪"),
-        "Compliance":       ("Compliance", "🔍"),
-        "Self-Correct":     ("SELF-CORR",  "🔄"),
-        "Entity":           ("Entity",     "🕸"),
-        "Financial":        ("Financial",  "💰"),
-        "Risk Score":       ("Risk",       "⚖"),
-        "HITL":             ("HITL",       "👤"),
-        "Cache":            ("Cache",      "💾"),
-    }
-    log_text = " ".join(audit_log).upper()
-    cols = st.columns(len(agents))
-    for i, (label, (keyword, icon)) in enumerate(agents.items()):
-        ran     = keyword.upper() in log_text
-        flagged = ran and any(
-            w in log_text for w in
-            ["FAIL", "FLAGGED", "AMBIGUOUS", "INCONSISTENT"]
-            if keyword.upper() in log_text
-        )
-        dot = "🟢" if (ran and not flagged) else ("🔴" if flagged else "⚫")
-        cols[i].markdown(
-            f"<div style='text-align:center;font-size:0.75rem'>"
-            f"{dot}<br>{icon} {label}</div>",
-            unsafe_allow_html=True,
-        )
-
-
 def show_self_correction(audit_log: list) -> None:
     """Shows the self-correction banner if the loop triggered."""
-    loop_lines = [l for l in audit_log if "SELF-CORRECTION" in l.upper()]
+    loop_lines  = [l for l in audit_log if "SELF-CORRECTION" in l.upper()
+                   or "REFINEMENT REQUEST" in l.upper()]
     clear_lines = [l for l in audit_log
                    if "REFINEMENT" in l.upper() and "CLEAR" in l.upper()]
     if loop_lines:
@@ -207,30 +164,89 @@ def show_self_correction(audit_log: list) -> None:
           <span style="color:#A5B4FC;font-size:0.88rem">{loop_lines[0]}</span>
         </div>
         """, unsafe_allow_html=True)
-
     if clear_lines:
         st.success("✅ Autonomously resolved — compliance ambiguity cleared by agent")
 
 
 def show_contributing_factors(factors: list) -> None:
-    """Renders the contributing factors as a clean table."""
     if not factors:
         return
     rows = []
     for f in factors:
+        ev = f.get("evidence", "")
         rows.append({
             "Factor":       f.get("factor", ""),
             "Weight":       f"{f.get('weight', 0)*100:.0f}%",
-            "Evidence":     f.get("evidence", "")[:120] + "..."
-                            if len(f.get("evidence","")) > 120
-                            else f.get("evidence",""),
+            "Evidence":     (ev[:120] + "...") if len(ev) > 120 else ev,
             "Contribution": f"{f.get('score_contribution', 0):.3f}",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
+    """
+    Renders the full decision view for ONE case state — used by both the
+    Pipeline results panel and the Review Queue detail panel.
+    """
+    audit_log = result.get("audit_log", [])
+    decision  = result.get("decision",  "REVIEW")
+    score     = result.get("risk_score", 0.0)
+    band      = result.get("risk_band",  "?")
+    refines   = result.get("refine_count", 0)
+
+    st.markdown(f"<div style='margin:8px 0'>{decision_badge(decision)}</div>",
+                unsafe_allow_html=True)
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Risk Score", f"{score:.2f}")
+    r2.metric("Risk Band",  band)
+    r3.metric("Self-Correction Loops", refines)
+    st.progress(min(float(score), 1.0), text=f"Risk: {score:.0%}")
+
+    st.divider()
+    show_self_correction(audit_log)
+
+    st.markdown("**Decision Explanation**")
+    explanation = result.get("explanation", "")
+    if explanation and "[LLM unavailable]" not in explanation:
+        st.info(explanation)
+    else:
+        st.info("vLLM explanation unavailable — connect to MI300X for the full "
+                "narrative. (The decision and evidence below are still valid.)")
+
+    # Salary-slip verification, if a slip was processed
+    iv = (result.get("financial_profile") or {}).get("income_verification")
+    if iv:
+        if iv.get("status") == "VERIFIED":
+            st.success(f"💸 Income proof: {iv.get('note')}")
+        else:
+            st.warning(f"💸 Income proof: {iv.get('note')}")
+
+    st.markdown("**Contributing Factors**")
+    show_contributing_factors(result.get("contributing_factors", []))
+
+    if show_overlay:
+        img_path = st.session_state.aadhaar_img_path
+        if img_path and os.path.exists(img_path):
+            st.markdown("**Document Analysis (Aadhaar front)**")
+            overlaid = draw_aadhaar_overlay(
+                img_path,
+                result.get("bounding_boxes",        {}),
+                result.get("low_confidence_fields", []),
+                result.get("field_confidence",      {}),
+            )
+            if overlaid:
+                st.image(overlaid,
+                         caption="🟢 High confidence  🟡 Medium / Low confidence",
+                         width=380)
+
+    with st.expander("📋 Full Audit Trail", expanded=False):
+        for line in audit_log:
+            st.markdown(f'<p class="audit-line">→ {line}</p>',
+                        unsafe_allow_html=True)
+
+
 # ════════════════════════════════════════════════════════════════
-# HEADER
+# HEADER + INTRO
 # ════════════════════════════════════════════════════════════════
 
 st.markdown("""
@@ -245,14 +261,36 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+<div class="intro-card">
+  <span style="font-size:1.0rem;color:#F0F4F8;font-weight:600">
+    Automated customer due diligence, India-first.
+  </span><br>
+  <span style="color:#CBD5E1;font-size:0.9rem">
+  Submit a customer's <b>Aadhaar card</b> (the primary identity document under
+  the RBI KYC Master Direction) and declared details. A team of specialised AI
+  agents then runs the case end-to-end:
+  &nbsp;<b>① Extract</b> identity fields from the Aadhaar →
+  <b>② Verify</b> them against what was declared →
+  <b>③ Screen</b> the name against FIU-IND / ED / PMLA / UN watchlists →
+  <b>④ Profile</b> corporate links and income →
+  <b>⑤ Score</b> the risk and either auto-approve or route to a human officer.
+  Clean cases clear in seconds; anything ambiguous is sent to the
+  <b>Review Queue</b> for a compliance officer to decide.
+  </span>
+</div>
+""", unsafe_allow_html=True)
+
 
 # ════════════════════════════════════════════════════════════════
 # TABS
 # ════════════════════════════════════════════════════════════════
 
-tab_kyc, tab_bulk, tab_telemetry = st.tabs([
+q = counts()
+tab_kyc, tab_bulk, tab_queue, tab_telemetry = st.tabs([
     "🔐 KYC Pipeline",
     "📦 Bulk Import Stress Test",
+    f"🧑‍⚖️ Review Queue ({q['pending']})",
     "⚡ ROCm Telemetry",
 ])
 
@@ -268,27 +306,34 @@ with tab_kyc:
     # ── LEFT: Upload + Declared Data Form ─────────────────────
     with col_form:
         st.subheader("Customer Submission")
+        st.caption("Fields marked **\\***  are required.")
 
+        st.markdown("**Documents**")
         aadhaar_file = st.file_uploader(
-            "Aadhaar Card (front face)", type=["jpg", "jpeg", "png"],
-            help="Upload the Aadhaar card image. OCR will extract all fields.",
+            "Aadhaar Card — Front *", type=["jpg", "jpeg", "png"],
+            help="Front face: photo, name, DOB, Aadhaar number. OCR reads these.",
         )
-        pan_file = st.file_uploader(
-            "PAN Card", type=["jpg", "jpeg", "png"],
+        aadhaar_back_file = st.file_uploader(
+            "Aadhaar Card — Back (address / QR side)", type=["jpg", "jpeg", "png"],
+            help="Back side carries the full address and the QR 'care_of' "
+                 "(father's/husband's name) used by the self-correction loop.",
+        )
+        salary_slip_file = st.file_uploader(
+            "Salary Slip / Income Proof (optional)", type=["jpg", "jpeg", "png"],
+            help="If provided, the financial agent verifies declared income "
+                 "against the figure on the slip.",
         )
 
         st.markdown("**Declared Information**")
-
         c1, c2 = st.columns(2)
-        name        = c1.text_input("Full Name",           placeholder="Priya Sharma")
-        dob         = c2.text_input("Date of Birth",       placeholder="YYYY-MM-DD")
-        address     = st.text_input("Residential Address", placeholder="B-204, Green Park, Bengaluru")
+        name        = c1.text_input("Full Name *")
+        dob         = c2.text_input("Date of Birth *  (YYYY-MM-DD)")
+        address     = st.text_input("Residential Address")
         c3, c4      = st.columns(2)
-        pin_code    = c3.text_input("PIN Code",            placeholder="560034")
-        nationality = c4.text_input("Nationality",         value="Indian")
+        pin_code    = c3.text_input("PIN Code")
+        nationality = c4.text_input("Nationality", value="Indian")
         father_name = st.text_input(
             "Father's / Husband's Name (optional)",
-            placeholder="As on Aadhaar C/O field",
             help="Used by the self-correction loop to disambiguate watchlist "
                  "matches when the Aadhaar QR cannot be parsed.",
         )
@@ -304,197 +349,75 @@ with tab_kyc:
         )
         st.caption(f"Selected band: ₹{income:,.0f} p.a.")
 
-        sof     = st.text_input(
-            "Source of Funds",
-            placeholder="Monthly salary from Infosys Limited",
-        )
-        purpose = st.text_input(
-            "Account Purpose",
-            placeholder="Savings and mutual fund investments",
-        )
+        sof     = st.text_input("Source of Funds")
+        purpose = st.text_input("Account Purpose")
 
-        run_btn = st.button(
-            "🚀 Run KYC", type="primary", use_container_width=True,
-        )
+        run_btn = st.button("🚀 Run KYC", type="primary", use_container_width=True)
 
     # ── RIGHT: Results Panel ───────────────────────────────────
     with col_results:
         st.subheader("KYC Decision")
 
         if run_btn:
-            # Validate minimum inputs
             if not name or not dob:
                 st.error("Please enter at least the customer's name and date of birth.")
                 st.stop()
 
-            # Save uploaded files
-            aadhaar_path = save_upload(aadhaar_file) if aadhaar_file else "/uploads/no_image.jpg"
-            pan_path     = save_upload(pan_file)     if pan_file     else "/uploads/no_pan.jpg"
+            aadhaar_path     = save_upload(aadhaar_file)     if aadhaar_file     else ""
+            aadhaar_back_path = save_upload(aadhaar_back_file) if aadhaar_back_file else ""
+            salary_slip_path = save_upload(salary_slip_file) if salary_slip_file else ""
 
-            if aadhaar_file:
-                st.session_state.aadhaar_img_path = aadhaar_path
+            st.session_state.aadhaar_img_path = aadhaar_path or None
 
-            # Build initial state
             customer_id = f"CUST-IN-{datetime.now().strftime('%Y%m%d%H%M%S')}"
             initial = create_initial_state(
-                customer_id     = customer_id,
-                name            = name,
-                dob             = dob,
-                nationality     = nationality,
-                address         = address,
-                pin_code        = pin_code,
-                occupation      = occupation.lower(),
-                income          = float(income),
-                source_of_funds = sof,
-                account_purpose = purpose,
-                aadhaar_path    = aadhaar_path,
-                pan_path        = pan_path,
-                received_at     = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
+                customer_id       = customer_id,
+                name              = name,
+                dob               = dob,
+                nationality       = nationality,
+                address           = address,
+                pin_code          = pin_code,
+                occupation        = occupation.lower(),
+                income            = float(income),
+                source_of_funds   = sof,
+                account_purpose   = purpose,
+                aadhaar_path      = aadhaar_path,
+                aadhaar_back_path = aadhaar_back_path,
+                salary_slip_path  = salary_slip_path,
+                received_at       = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
             )
             if father_name:
                 initial["declared"]["father_name"] = father_name
 
-            # Run the pipeline
-            with st.spinner("🔍 Agents processing — Extraction → ID Verify → Compliance → Risk..."):
-                app_graph = get_graph()
-                result    = app_graph.invoke(initial)
+            with st.spinner("🔍 Agents processing — Extraction → ID Verify → "
+                            "Compliance → Risk..."):
+                result = get_graph().invoke(initial)
 
             st.session_state.case_result = result
-            st.session_state.case_closed = False
+
+            # Route anything that needs a human into the persistent inbox.
+            if result.get("routing") == Routing.ROUTE_TO_HUMAN:
+                st.session_state.queued_id = enqueue_case(result)
+            else:
+                st.session_state.queued_id = None
 
         # ── Render results if available ────────────────────────
         result = st.session_state.case_result
         if result:
-            audit_log = result.get("audit_log", [])
-            decision  = result.get("decision",  "REVIEW")
-            score     = result.get("risk_score", 0.0)
-            band      = result.get("risk_band",  "?")
-            routing   = result.get("routing",    Routing.ROUTE_TO_HUMAN)
-            refines   = result.get("refine_count", 0)
-
-            # Decision badge + score
-            st.markdown(
-                f"<div style='margin:8px 0'>{decision_badge(decision)}</div>",
-                unsafe_allow_html=True,
-            )
-            r1, r2, r3 = st.columns(3)
-            r1.metric("Risk Score", f"{score:.2f}")
-            r2.metric("Risk Band",  band)
-            r3.metric("Self-Correction Loops", refines)
-
-            score_color = (
-                "normal" if score < 0.30 else
-                "inverse" if score > 0.65 else "off"
-            )
-            st.progress(float(score), text=f"Risk: {score:.0%}")
+            render_case_evidence(result, show_overlay=True)
 
             st.divider()
-
-            # Self-correction banner
-            show_self_correction(audit_log)
-
-            # Agent status row
-            st.markdown("**Agent Status**")
-            agent_status_row(audit_log)
-
-            st.divider()
-
-            # Explanation
-            st.markdown("**Decision Explanation**")
-            explanation = result.get("explanation", "")
-            if explanation and "[LLM unavailable]" not in explanation:
-                st.info(explanation)
+            if result.get("routing") == Routing.ROUTE_TO_HUMAN:
+                st.warning(
+                    "⚠ **Human review required** — this case was added to the "
+                    f"**Review Queue** tab as `{st.session_state.queued_id}`. "
+                    "A compliance officer will approve, reject, or hold it there."
+                )
             else:
-                st.info(
-                    "vLLM explanation unavailable — "
-                    "connect to MI300X for full narrative output."
-                )
-
-            # Contributing factors
-            st.markdown("**Contributing Factors**")
-            show_contributing_factors(result.get("contributing_factors", []))
-
-            # Aadhaar overlay
-            img_path = st.session_state.aadhaar_img_path
-            if img_path and os.path.exists(img_path):
-                st.markdown("**Document Analysis**")
-                overlaid = draw_aadhaar_overlay(
-                    img_path,
-                    result.get("bounding_boxes",        {}),
-                    result.get("low_confidence_fields", []),
-                    result.get("field_confidence",      {}),
-                )
-                if overlaid:
-                    st.image(overlaid, caption="🟢 High confidence  🟡 Medium  🟠 Low confidence", width=380)
-
-            # Audit trail
-            with st.expander("📋 Full Audit Trail", expanded=False):
-                for line in audit_log:
-                    st.markdown(f'<p class="audit-line">→ {line}</p>', unsafe_allow_html=True)
-
-            st.divider()
-
-            # ── HITL Review Panel ──────────────────────────────
-            if routing == Routing.ROUTE_TO_HUMAN and not st.session_state.case_closed:
-                st.markdown("""
-                <div style='background:#1c1917;border:1px solid #F59E0B;
-                     border-radius:8px;padding:16px;margin:8px 0'>
-                <strong style='color:#F59E0B'>⚠ Human Review Required</strong><br>
-                <span style='color:#D1D5DB;font-size:0.9rem'>
-                This case has been routed to the compliance officer queue.
-                Review the evidence above and make your decision below.
-                </span></div>
-                """, unsafe_allow_html=True)
-
-                officer_id = st.text_input("Officer ID", value="OFFICER-KYC-001")
-                rationale  = st.text_area(
-                    "Decision Rationale",
-                    placeholder="Enter your reasoning for the decision...",
-                    height=100,
-                )
-                h1, h2, h3 = st.columns(3)
-
-                if h1.button("✅ Approve", use_container_width=True):
-                    closed = complete_case(
-                        result, officer_id,
-                        Decision.APPROVE, rationale,
-                        override=(decision != Decision.APPROVE),
-                    )
-                    st.session_state.closed_result = closed
-                    st.session_state.case_closed   = True
-                    st.rerun()
-
-                if h2.button("🚫 Reject", use_container_width=True):
-                    closed = complete_case(
-                        result, officer_id,
-                        Decision.REJECT, rationale,
-                        override=(decision != Decision.REJECT),
-                    )
-                    st.session_state.closed_result = closed
-                    st.session_state.case_closed   = True
-                    st.rerun()
-
-                if h3.button("📁 Hold for Documents", use_container_width=True):
-                    closed = complete_case(
-                        result, officer_id,
-                        Decision.HOLD_FOR_DOCUMENTS, rationale, False,
-                    )
-                    st.session_state.closed_result = closed
-                    st.session_state.case_closed   = True
-                    st.rerun()
-
-            # Closed case confirmation
-            if st.session_state.case_closed and st.session_state.closed_result:
-                cr = st.session_state.closed_result
-                st.success(
-                    f"✅ Case closed — **{cr.get('final_decision')}** "
-                    f"by {cr.get('human_decision', {}).get('officer_id', '?')} "
-                    f"at {cr.get('closed_at', '?')} | "
-                    f"Decision cached: {cr.get('cache_update', {}).get('status', '?')}"
-                )
-
+                st.success("✅ **Auto-approved** — no human review needed.")
         else:
-            st.info("Upload an Aadhaar card, fill in the declared data, and click **Run KYC** to begin.")
+            st.info("Upload the Aadhaar front, fill in the declared data, and "
+                    "click **Run KYC** to begin.")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -506,15 +429,11 @@ with tab_bulk:
     st.markdown(
         "Simulates 20 simultaneous customer onboarding requests. "
         "Watch the pipeline auto-approve clean profiles and route "
-        "high-risk cases to the human review queue in real time."
+        "high-risk cases to the human Review Queue in real time."
     )
 
-    # Check mock data exists
     if not os.path.exists(BULK_DOSSIERS_PATH):
-        st.warning(
-            f"Mock data not found at `{BULK_DOSSIERS_PATH}`. "
-            "Ask Claude to generate `bulk_customers.json` and place it in `./mock_data/`."
-        )
+        st.warning(f"Mock data not found at `{BULK_DOSSIERS_PATH}`.")
     else:
         with open(BULK_DOSSIERS_PATH, encoding="utf-8") as f:
             customers = json.load(f)
@@ -523,18 +442,14 @@ with tab_bulk:
                 f"ready to process on AMD MI300X")
 
         if st.button("🚀 Import All Customers", type="primary", use_container_width=True):
-            st.session_state.bulk_results  = []
-            st.session_state.bulk_running  = True
+            st.session_state.bulk_results = []
+            st.session_state.bulk_queued  = 0
             app_graph = get_graph()
 
-            # Live results table
-            table_placeholder = st.empty()
+            table_placeholder   = st.empty()
             summary_placeholder = st.empty()
 
-            approved  = 0
-            review    = 0
-            rejected  = 0
-            processed = 0
+            approved = review = rejected = processed = queued = 0
 
             for customer in customers:
                 try:
@@ -549,20 +464,17 @@ with tab_bulk:
                         income          = float(customer.get("income", 0)),
                         source_of_funds = customer.get("source_of_funds", ""),
                         account_purpose = customer.get("account_purpose", ""),
-                        aadhaar_path    = customer.get("aadhaar_path", "/uploads/mock.jpg"),
-                        pan_path        = customer.get("pan_path",    "/uploads/mock_pan.jpg"),
+                        aadhaar_path    = customer.get("aadhaar_path", ""),
                         received_at     = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
                     )
-                    # Father's name passthrough — lets the self-correction
-                    # loop resolve bulk profiles that have no Aadhaar image
-                    # (the refinement pass picks it up as the QR 'care_of').
+                    # Father's name passthrough — lets the self-correction loop
+                    # resolve bulk profiles that have no Aadhaar image.
                     if customer.get("father_name"):
                         initial["declared"]["father_name"] = customer["father_name"]
 
-                    final = app_graph.invoke(initial)
-
-                    dec   = final.get("decision",  "REVIEW")
-                    score = final.get("risk_score", 0.0)
+                    final   = app_graph.invoke(initial)
+                    dec     = final.get("decision",  "REVIEW")
+                    score   = final.get("risk_score", 0.0)
                     refines = final.get("refine_count", 0)
 
                     if dec == Decision.APPROVE:
@@ -575,80 +487,151 @@ with tab_bulk:
                         review += 1
                         status_icon = "⚠️ Human Review"
 
+                    # Send every human-routed case to the persistent queue.
+                    if final.get("routing") == Routing.ROUTE_TO_HUMAN:
+                        if enqueue_case(final):
+                            queued += 1
+
                     st.session_state.bulk_results.append({
-                        "#":          processed + 1,
-                        "Name":       customer.get("name", ""),
-                        "Occupation": customer.get("occupation", ""),
-                        "Income ₹":   f"₹{float(customer.get('income',0)):,.0f}",
-                        "Score":      f"{score:.2f}",
+                        "#":            processed + 1,
+                        "Name":         customer.get("name", ""),
+                        "Occupation":   customer.get("occupation", ""),
+                        "Income ₹":     f"₹{float(customer.get('income',0)):,.0f}",
+                        "Score":        f"{score:.2f}",
                         "Self-Correct": "🔄 Yes" if refines > 0 else "—",
-                        "Decision":   status_icon,
+                        "Decision":     status_icon,
                     })
 
                 except Exception as e:
                     st.session_state.bulk_results.append({
-                        "#":          processed + 1,
-                        "Name":       customer.get("name",""),
-                        "Occupation": "",
-                        "Income ₹":   "",
-                        "Score":      "—",
+                        "#":            processed + 1,
+                        "Name":         customer.get("name", ""),
+                        "Occupation":   "",
+                        "Income ₹":     "",
+                        "Score":        "—",
                         "Self-Correct": "—",
-                        "Decision":   f"❌ Error: {str(e)[:40]}",
+                        "Decision":     f"❌ Error: {str(e)[:40]}",
                     })
 
                 processed += 1
 
-                # Update live table
                 df = pd.DataFrame(st.session_state.bulk_results)
                 table_placeholder.dataframe(df, use_container_width=True, hide_index=True)
 
-                # Update summary metrics
                 with summary_placeholder.container():
                     m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Processed",      processed)
+                    m1.metric("Processed",       processed)
                     m2.metric("✅ Auto-Approved", approved)
-                    m3.metric("⚠️ Human Review", review)
-                    m4.metric("⛔ Rejected",     rejected)
-                    m5.metric("Progress",       f"{processed}/{len(customers)}")
+                    m3.metric("⚠️ Human Review",  review)
+                    m4.metric("⛔ Rejected",      rejected)
+                    m5.metric("Progress",        f"{processed}/{len(customers)}")
 
-            # Final summary
+            st.session_state.bulk_queued = queued
             st.balloons()
             st.success(
-                f"**Bulk import complete** — "
-                f"{approved} auto-approved · "
-                f"{review} routed to human review · "
-                f"{rejected} rejected · "
-                f"processed {processed} cases on AMD MI300X"
+                f"**Bulk import complete** — {approved} auto-approved · "
+                f"{review} routed to human review · {rejected} rejected · "
+                f"processed {processed} cases on AMD MI300X."
             )
-            st.session_state.bulk_running = False
+            st.info(f"🧑‍⚖️ {queued} case(s) added to the **Review Queue** tab "
+                    f"for officer action.")
 
-        # Show previous results if available
         elif st.session_state.bulk_results:
             st.dataframe(
                 pd.DataFrame(st.session_state.bulk_results),
                 use_container_width=True, hide_index=True,
             )
-            approved = sum(
-                1 for r in st.session_state.bulk_results
-                if "Approved" in r.get("Decision","")
-            )
-            review   = sum(
-                1 for r in st.session_state.bulk_results
-                if "Review" in r.get("Decision","")
-            )
-            rejected = sum(
-                1 for r in st.session_state.bulk_results
-                if "Rejected" in r.get("Decision","")
-            )
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("✅ Auto-Approved", approved)
-            c2.metric("⚠️ Human Review", review)
-            c3.metric("⛔ Rejected",     rejected)
-            c4.metric("Total Processed", len(st.session_state.bulk_results))
 
 
 # ════════════════════════════════════════════════════════════════
-# TAB 3 — ROCM TELEMETRY
+# TAB 3 — REVIEW QUEUE  (compliance-officer inbox, persisted to disk)
+# ════════════════════════════════════════════════════════════════
+
+with tab_queue:
+    st.subheader("🧑‍⚖️ Compliance Review Queue")
+    st.caption("Every case the pipeline routes to a human — from a single run "
+               "or the bulk import — lands here. Persisted to disk, so the "
+               "inbox survives restarts.")
+
+    pending = list_cases(STATUS_PENDING)
+    closed  = list_cases(STATUS_CLOSED)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("⏳ Awaiting Review", len(pending))
+    m2.metric("✅ Decided",          len(closed))
+    m3.metric("📂 Total",            len(pending) + len(closed))
+
+    if not pending:
+        st.info("No cases awaiting review. Cases routed to human review will "
+                "appear here automatically.")
+    else:
+        labels = {
+            f"{r['customer_id']} — {r['summary'].get('name','')} "
+            f"· {r['summary'].get('decision','')} "
+            f"· risk {float(r['summary'].get('risk_score',0)):.2f}": r["customer_id"]
+            for r in pending
+        }
+        choice = st.selectbox("Pending cases", list(labels.keys()))
+        cid    = labels[choice]
+        rec    = get_case(cid)
+        state  = rec["state"]
+
+        st.divider()
+        render_case_evidence(state, show_overlay=False)
+
+        st.divider()
+        st.markdown("#### Officer Decision")
+        officer_id = st.text_input("Officer ID", value="OFFICER-KYC-001",
+                                   key=f"off_{cid}")
+        rationale  = st.text_area("Decision Rationale", height=90,
+                                  key=f"rat_{cid}")
+        sys_decision = state.get("decision", Decision.REVIEW)
+
+        b1, b2, b3 = st.columns(3)
+        if b1.button("✅ Approve", use_container_width=True, key=f"ap_{cid}"):
+            closed_state = complete_case(state, officer_id, Decision.APPROVE,
+                                         rationale,
+                                         override=(sys_decision != Decision.APPROVE))
+            close_case(cid, closed_state)
+            st.rerun()
+        if b2.button("🚫 Reject", use_container_width=True, key=f"rj_{cid}"):
+            closed_state = complete_case(state, officer_id, Decision.REJECT,
+                                         rationale,
+                                         override=(sys_decision != Decision.REJECT))
+            close_case(cid, closed_state)
+            st.rerun()
+        if b3.button("📁 Hold for Documents", use_container_width=True, key=f"hd_{cid}"):
+            closed_state = complete_case(state, officer_id,
+                                         Decision.HOLD_FOR_DOCUMENTS, rationale, False)
+            close_case(cid, closed_state)
+            st.rerun()
+
+    # ── Decided-cases history ─────────────────────────────────
+    if closed:
+        with st.expander(f"✅ Decided cases ({len(closed)})", expanded=False):
+            rows = []
+            for r in closed:
+                hd = (r.get("state", {}) or {}).get("human_decision", {}) or {}
+                rows.append({
+                    "Case":     r["customer_id"],
+                    "Name":     r["summary"].get("name", ""),
+                    "Final":    r.get("final_decision", ""),
+                    "Officer":  hd.get("officer_id", ""),
+                    "Closed":   r.get("closed_at", ""),
+                    "Rationale": (hd.get("rationale", "") or "")[:80],
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if pending or closed:
+        with st.expander("⚙ Queue admin", expanded=False):
+            st.caption("Reset the inbox between demo runs.")
+            if st.button("🗑 Clear entire queue"):
+                clear_queue()
+                st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════
+# TAB 4 — ROCM TELEMETRY
 # ════════════════════════════════════════════════════════════════
 
 with tab_telemetry:
