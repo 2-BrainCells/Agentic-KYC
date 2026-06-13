@@ -1,4 +1,4 @@
-# CLAUDE.md — Agentic KYC Intelligence Platform
+# Agentic KYC Intelligence Platform
 
 > Context file for Claude / Claude Code. Read this first before working on the project.
 > It explains what we are building, why, the architecture, every file, and the rules.
