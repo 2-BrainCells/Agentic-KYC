@@ -18,14 +18,8 @@ maintaining explainability and human oversight.
 income in INR (₹), and Indian regulatory context (FIU-IND, ED, PMLA, RBI KYC
 Master Direction, FEMA, MCA21).
 
-### Hackathon constraints (important context)
-- **Team:** 2 people, **beginner-level** AI/ML knowledge.
-- **Time:** 4 days.
-- **Hardware:** AMD Instinct **MI300X** (192 GB HBM3), cloud-hosted notebook.
-- **Goal:** Win. The demo matters more than code completeness.
-
 ### What makes this win (the three differentiators — PROTECT THESE)
-1. **Self-correction loop** — the agentic "true autonomy" flex (see §4).
+1. **Self-correction loop** — the agentic "true autonomy" flex.
 2. **Live ROCm GPU telemetry** — proves AMD hardware exploitation with real numbers.
 3. **Bulk import stress test** — 20 customers processed live; the demo climax.
 
@@ -288,7 +282,7 @@ pip install streamlit langgraph openai pytesseract pillow qdrant-client[fastembe
 sudo apt-get update
 sudo apt-get install -y tesseract-ocr tesseract-ocr-hin
 
-hf auth login
+hf auth login 
 
 # vLLM (separate terminal) — port MUST match config.VLLM_URL
 vllm serve meta-llama/Meta-Llama-3-8B-Instruct --port 8000
@@ -305,7 +299,8 @@ python graph.py
 python bulk_acceptance_test.py
 
 # Launch the UI
-streamlit run app.py
+streamlit run app.py --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false
+https://notebooks.amd.com/jupyter-hack-team-2423-260615173053-71ab4322/poxy/8501
 ```
 
 **Environment-specific:** if vLLM starts on a non-8000 port, update `VLLM_URL`

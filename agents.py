@@ -83,11 +83,19 @@ def _name_similarity(name_a: str, name_b: str) -> float:
     parts_a = set(a.split())
     parts_b = set(b.split())
     if parts_a and parts_b:
-        component = len(parts_a & parts_b) / max(len(parts_a), len(parts_b))
+        overlap   = len(parts_a & parts_b)
+        component = overlap / max(len(parts_a), len(parts_b))
+        # Containment: Indian names routinely drop a middle name — a customer
+        # states "Ramesh Mehta" while the watchlist lists "Ramesh Prakash
+        # Mehta". If every token of the shorter name appears in the longer one,
+        # treat it as a strong match. Require the shorter name to have 2+ tokens
+        # so a lone shared surname (e.g. just "Mehta") can't trigger it.
+        smaller     = min(len(parts_a), len(parts_b))
+        containment = 0.90 if (smaller >= 2 and overlap == smaller) else 0.0
     else:
-        component = 0.0
+        component = containment = 0.0
 
-    return round(max(direct, component), 3)
+    return round(max(direct, component, containment), 3)
 
 
 def _dob_year(dob: str) -> int:

@@ -13,7 +13,13 @@
       "PowerShell($env:PYTHONUTF8='1'; python bulk_acceptance_test.py)",
       "Bash(python bulk_acceptance_test.py)",
       "Bash(PYTHONIOENCODING=utf-8 python -u bulk_acceptance_test.py)",
-      "Bash(PYTHONIOENCODING=utf-8 python -u graph.py)"
+      "Bash(PYTHONIOENCODING=utf-8 python -u graph.py)",
+      "PowerShell(python uidai.py)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python uidai.py)",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python bulk_acceptance_test.py 2>&1 | Select-Object -Last 40)",
+      "Bash(PYTHONIOENCODING=utf-8 python *)",
+      "Bash(grep -rhoin \"streamlit run[^\\\\\"\\\\\\\\]*\" /c/Users/asus/.claude/projects/D--KYC/*.jsonl)",
+      "Bash(python *)"
     ]
   }
 }

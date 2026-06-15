@@ -404,10 +404,32 @@ with tab_kyc:
         # ── Render results if available ────────────────────────
         result = st.session_state.case_result
         if result:
+            # If this case was routed to a human and an officer has since
+            # decided it in the Review Queue, reflect that final decision here
+            # instead of the stale "awaiting review" banner.
+            queued_id  = st.session_state.get("queued_id")
+            closed_rec = None
+            if queued_id:
+                rec = get_case(queued_id)
+                if rec and rec.get("status") == STATUS_CLOSED:
+                    closed_rec = rec
+                    result = dict(rec.get("state", result))
+                    # Surface the officer's final decision on the badge.
+                    if result.get("final_decision"):
+                        result["decision"] = result["final_decision"]
+
             render_case_evidence(result, show_overlay=True)
 
             st.divider()
-            if result.get("routing") == Routing.ROUTE_TO_HUMAN:
+            if closed_rec:
+                hd    = result.get("human_decision") or {}
+                final = result.get("final_decision", result.get("decision", ""))
+                st.success(
+                    f"🧑‍⚖️ **Officer decision recorded** — final decision "
+                    f"**{final}** by `{hd.get('officer_id','')}` "
+                    f"(case `{queued_id}` closed)."
+                )
+            elif result.get("routing") == Routing.ROUTE_TO_HUMAN:
                 st.warning(
                     "⚠ **Human review required** — this case was added to the "
                     f"**Review Queue** tab as `{st.session_state.queued_id}`. "
