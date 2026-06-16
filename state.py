@@ -162,6 +162,11 @@ class KYCState(TypedDict, total=False):
     # Always — parallel-safe audit log (written by every agent)
     audit_log: Annotated[list, add]   # ordered list of plain-string actions
 
+    # Always — parallel-safe step-wise checklists (one per agent run) for the
+    # live "decisions forming" UI. Uses the same add reducer so the two parallel
+    # agents (and the refine loop's re-runs) append instead of overwriting.
+    agent_checklists: Annotated[list, add]
+
 
 # ── Initial-state helper ─────────────────────────────────────────────────────
 

@@ -180,6 +180,11 @@ def parse_aadhaar_fields(
     else:
         focus = (
             "This is a STANDARD first pass. Extract all identity fields you can find.\n"
+            "The text may include the Aadhaar BACK side: read the full ADDRESS and, "
+            "if a 'Care Of' line is printed (C/O, S/O, W/O, D/O), capture the "
+            "father's/husband's name into 'father_name'. If no such line is printed, "
+            "leave 'father_name' null — do not guess.\n"
+            "DOB on an Aadhaar is printed as DD/MM/YYYY — convert it to YYYY-MM-DD.\n"
             "Set 'extraction_pass' to 0."
         )
 

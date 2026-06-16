@@ -57,6 +57,23 @@ def _now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+# ── Step-wise checklist helpers (explainability) ─────────────────────────────
+# Each agent emits a structured checklist of the checks it ACTUALLY ran, so the
+# UI can show the decision forming step by step. Status is one of:
+#   "pass" → ✓   "fail" → ✗   "warn" → ⚠   "info" → •
+# These are built from values the agent already computed — no extra LLM calls,
+# fully deterministic.
+
+def _step(label: str, status: str, detail: str = "") -> dict:
+    """One checklist line: the check performed, its status, and the value seen."""
+    return {"label": label, "status": status, "detail": detail}
+
+
+def _checklist(agent: str, icon: str, steps: list, summary: str) -> dict:
+    """Bundle one agent's checklist for the live UI and the audit view."""
+    return {"agent": agent, "icon": icon, "steps": steps, "summary": summary}
+
+
 def _name_similarity(name_a: str, name_b: str) -> float:
     """
     0.0–1.0 similarity between two names, case-insensitive and order-agnostic.
@@ -99,7 +116,14 @@ def _normalize_dob(dob: str) -> str:
     """
     if not dob:
         return ""
-    s = dob.strip().replace("/", "-").replace(".", "-")
+    s = dob.strip().replace("/", "-").replace(".", "-").replace(" ", "")
+    # Separator-less 8-digit form. Aadhaar prints DOB as DDMMYYYY.
+    if re.fullmatch(r"\d{8}", s):
+        d, mo, y = s[:2], s[2:4], s[4:]
+        try:
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        except ValueError:
+            return s
     m = re.match(r"^(\d{1,4})-(\d{1,2})-(\d{1,4})$", s)
     if not m:
         return s
@@ -257,8 +281,17 @@ def intake_agent(state: KYCState) -> KYCState:
     income  = state.get("declared", {}).get("income", 0)
     name    = state.get("declared", {}).get("name", "UNKNOWN")
 
+    steps = [
+        _step("Case intake received", "pass", cid),
+        _step("Applicant identified", "pass" if name != "UNKNOWN" else "warn", name),
+        _step("Declared income captured", "pass" if income else "warn", f"₹{income:,.0f}"),
+    ]
+
     return {
         "case_status": CaseStatus.RECEIVED,
+        "agent_checklists": [_checklist(
+            "Intake", "📥", steps, f"Case {cid} accepted for processing"
+        )],
         "audit_log": [
             f"{_now()} [Intake] Case {cid} received — "
             f"Customer: {name}, Declared income: ₹{income:,.0f}"
@@ -340,6 +373,31 @@ def data_extraction_agent(state: KYCState) -> KYCState:
     if declared_fallback:
         father_note += " (declared-data fallback — document not readable)"
 
+    steps = [
+        _step(f"OCR Aadhaar front ({pass_label})",
+              "pass" if ocr_text.strip() and not declared_fallback else "warn",
+              "text read" if ocr_text.strip() else "no readable text"),
+        _step("OCR Aadhaar back (address / C-O)",
+              "pass" if used_back else "info",
+              "back side read" if used_back else "no back side provided"),
+        _step("Name extracted",
+              "pass" if extracted.get("full_name_english") else "fail",
+              str(name_found)),
+        _step("Date of birth extracted",
+              "pass" if extracted.get("dob") else "warn",
+              str(extracted.get("dob") or "not found")),
+        _step("Address extracted",
+              "pass" if extracted.get("address") else "warn",
+              str(extracted.get("address") or "not found")),
+        _step("Father / husband name (C/O)",
+              "pass" if father_found else "info",
+              str(father_found) if father_found
+              else ("deferred to refinement" if not is_refinement else "not on card")),
+    ]
+    if declared_fallback:
+        steps.append(_step("Declared-data fallback used", "warn",
+                           "document not readable — mirrored form data"))
+
     return {
         "extracted":             extracted,
         "field_confidence":      confidence,
@@ -347,6 +405,10 @@ def data_extraction_agent(state: KYCState) -> KYCState:
         "low_confidence_fields": low_conf,
         "extraction_status":     status,
         "case_status":           CaseStatus.EXTRACTING,
+        "agent_checklists": [_checklist(
+            "Data Extraction", "📄", steps,
+            f"Extraction {status} — {pass_label}"
+        )],
         "audit_log": [
             f"{_now()} [Extraction] {pass_label} — status: {status}, "
             f"name: '{name_found}', {father_note}, "
@@ -450,10 +512,33 @@ def id_verification_agent(state: KYCState) -> KYCState:
         "reasons":             reasons,
     }
 
+    steps = [
+        _step("Name matches declared", "pass" if name_match else "fail",
+              f"similarity {name_score:.2f} (need ≥ {NAME_MATCH_THRESHOLD:.2f})"),
+        _step("Date of birth matches", "pass" if dob_match else "fail",
+              f"{dec_dob or '—'} vs {ext_dob or '—'}"),
+        _step("PIN code matches", "pass" if pin_match else "fail",
+              f"{dec_pin or '—'} vs {ext_pin or '—'}" if pin_present else "not provided"),
+        _step("Address matches", "pass" if addr_match else "fail",
+              f"similarity {addr_score:.2f} (need ≥ {ADDRESS_MATCH_THRESHOLD:.2f})"
+              if addr_present else "not provided"),
+        _step("UIDAI status active", "pass" if uidai_active else "fail",
+              "ACTIVE" if uidai_active else "NOT ACTIVE"),
+        _step("PAN–Aadhaar linked", "pass" if pan_linked else "fail",
+              "linked" if pan_linked else "not linked"),
+        _step("Identity verified", "pass" if id_verified else "fail",
+              "all checks passed" if id_verified
+              else f"{len(flags)} check(s) failed → re-apply"),
+    ]
+
     return {
         "id_verified":        id_verified,
         "verification_details": details,
         "case_status":        CaseStatus.VERIFYING,
+        "agent_checklists": [_checklist(
+            "ID Verification", "🪪", steps,
+            "Verified" if id_verified else "Verification FAILED"
+        )],
         "audit_log": [
             f"{_now()} [ID Verify] verified={id_verified} (id_risk={id_risk_score:.2f}) — "
             f"name={name_score:.2f}, DOB={'✓' if dob_match else '✗'}, "
@@ -491,6 +576,14 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             "refinement_needed": False,
             "cache_hit":         cache_hit,
             "case_status":       CaseStatus.SCREENING,
+            "agent_checklists": [_checklist(
+                "Compliance Screening", "🛡️", [
+                    _step("Human exception cache", "pass",
+                          f"prior officer decision found: {cache_hit.get('decision')}"),
+                    _step("Re-screening skipped", "info",
+                          "cached decision reused"),
+                ], "CLEAR (from exception cache)"
+            )],
             "audit_log": [
                 f"{_now()} [Compliance] CACHE HIT — prior officer decision "
                 f"found: '{cache_hit.get('decision')}'. Skipping re-screen."
@@ -575,12 +668,47 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             )
 
     note_text = (" | " + " ; ".join(notes)) if notes else ""
+
+    status_state = {
+        ScreeningStatus.CLEAR:           "pass",
+        ScreeningStatus.AMBIGUOUS:       "warn",
+        ScreeningStatus.POTENTIAL_MATCH: "warn",
+        ScreeningStatus.CONFIRMED_HIT:   "fail",
+    }.get(status, "info")
+
+    steps = [
+        _step("Exception cache checked", "pass", "no prior decision"),
+        _step(f"Screened across {len(WATCHLISTS)} watchlists", "pass",
+              f"{len(hits)} candidate match(es)"),
+        _step("Best match score", status_state,
+              f"{best_score:.2f}"
+              + (f" — {best_hit.get('matched_name','')}" if best_hit else "")),
+    ]
+    if best_hit.get("dob_gate"):
+        steps.append(_step("DOB gate applied", "info", best_hit["dob_gate"]))
+    if father:
+        if best_hit.get("father_resolution"):
+            steps.append(_step("Father's-name resolution", status_state,
+                               best_hit["father_resolution"]))
+        else:
+            steps.append(_step("Father's name available", "info",
+                               f"'{father}' — compared against listed individuals"))
+    elif refine:
+        steps.append(_step("Father's name missing", "warn",
+                           "ambiguous match → self-correction loop requested"))
+    steps.append(_step(f"Screening status: {status}", status_state,
+                       "refinement requested" if refine else "no refinement needed"))
+
     return {
         "compliance_hits":   hits,
         "screening_status":  status,
         "refinement_needed": refine,
         "cache_hit":         None,
         "case_status":       CaseStatus.SCREENING,
+        "agent_checklists": [_checklist(
+            "Compliance Screening", "🛡️", steps,
+            f"{status} (best {best_score:.2f})"
+        )],
         "audit_log": [
             f"{_now()} [Compliance] '{name}' screened against "
             f"{len(WATCHLISTS)} watchlists — status: {status}, "
@@ -617,11 +745,23 @@ def refine_agent(state: KYCState) -> KYCState:
         "attempt":        count,
     }
 
+    steps = [
+        _step("Ambiguous match detected", "warn", reason),
+        _step(f"Refinement request #{count} issued", "info",
+              "re-extract at higher temperature"),
+        _step("Seeking disambiguating fields", "info",
+              "father_name (QR care_of), place_of_birth"),
+    ]
+
     return {
         "refine_count":        count,
         "refinement_request":  request,
         "current_agent_status": "REFINEMENT_REQUEST_ISSUED",
         "case_status":         CaseStatus.REFINING,
+        "agent_checklists": [_checklist(
+            "Self-Correction", "🔄", steps,
+            f"Refinement #{count} — looping back to extraction"
+        )],
         "audit_log": [
             f"{_now()} [Orchestrator] ⚠ AMBIGUOUS match for '{name}' — "
             f"Refinement Request #{count} issued to Extraction Agent. "
@@ -733,8 +873,25 @@ def entity_resolution_agent(state: KYCState) -> KYCState:
     status = "FLAGGED" if indirect_flag else "CLEAN"
     hops   = shortest_path["hop_distance"] if shortest_path else "N/A"
 
+    steps = [
+        _step("Customer entry points resolved", "pass" if customer_nodes else "info",
+              ", ".join(customer_nodes) if customer_nodes else "no graph entry point"),
+        _step("Corporate graph traversal (≤ 3 hops)",
+              "pass" if customer_nodes else "info",
+              f"{CORPORATE_GRAPH.number_of_nodes()} entities scanned"),
+        _step("Link to sanctioned entity",
+              "fail" if indirect_flag else "pass",
+              f"{hops}-hop chain found" if indirect_flag else "none within 3 hops"),
+    ]
+    if indirect_flag and shortest_path:
+        steps.append(_step("Shortest path", "info", " → ".join(shortest_path["path"])))
+
     return {
         "network_risk": network_risk,
+        "agent_checklists": [_checklist(
+            "Entity Resolution", "🕸️", steps,
+            f"Network {status}"
+        )],
         "audit_log": [
             f"{_now()} [Entity Resolution] corporate graph traversal — "
             f"status: {status}, "
@@ -863,8 +1020,31 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
         "financial_risk_contribution": round(fin_risk, 3),
     }
 
+    steps = [
+        _step("Income band assessed", "info",
+              f"₹{income:,.0f} → {income_band} band"),
+        _step("Income vs occupation plausible",
+              "pass" if plausibility["income_vs_occupation"] == "CONSISTENT" else "warn",
+              f"'{declared.get('occupation')}' (expected {occ_band})"),
+        _step("Source of funds", "pass" if not is_vague else "warn",
+              "plausible" if not is_vague else f"vague: '{declared.get('source_of_funds')}'"),
+    ]
+    if income_verification:
+        steps.append(_step("Salary slip verification",
+                           "pass" if income_verification["status"] == "VERIFIED" else "warn",
+                           income_verification["note"]))
+    for flag in anomaly_flags:
+        steps.append(_step("Anomaly flag", "warn", flag))
+    steps.append(_step("Enhanced due diligence required",
+                       "warn" if requires_edd else "pass",
+                       "yes — HNI income with anomalies" if requires_edd else "no"))
+
     return {
         "financial_profile": profile,
+        "agent_checklists": [_checklist(
+            "Financial Profiling", "💰", steps,
+            f"{plausibility['income_vs_occupation']} — {len(anomaly_flags)} flag(s)"
+        )],
         "audit_log": [
             f"{_now()} [Financial] ₹{income:,.0f} ({income_band} band), "
             f"occupation: '{declared.get('occupation')}', "
@@ -1048,6 +1228,32 @@ Write the explanation now:
 """
     explanation = call_text_llm(explanation_prompt, temperature=TEMP_EXPLANATION)
 
+    decision_state = {
+        Decision.APPROVE: "pass",
+        Decision.REVIEW:  "warn",
+        Decision.REJECT:  "fail",
+    }.get(decision, "info")
+
+    steps = [
+        _step("ID verification factor (30%)", "pass" if id_ok else "fail",
+              f"contribution {round(id_score*WEIGHT_ID_VERIFICATION,3)}"),
+        _step("Compliance factor (40%)",
+              "pass" if comp_status == ScreeningStatus.CLEAR else "warn",
+              f"{comp_status} → contribution {round(comp_score*WEIGHT_COMPLIANCE,3)}"),
+        _step("Network factor (20%)",
+              "fail" if net_score else "pass",
+              f"contribution {round(net_score*WEIGHT_NETWORK_RISK,3)}"),
+        _step("Financial factor (10%)",
+              "warn" if fin_score else "pass",
+              f"contribution {round(fin_score*WEIGHT_FINANCIAL,3)}"),
+        _step("Weighted risk score", decision_state,
+              f"{risk_score:.3f} ({risk_band})"),
+    ]
+    if override_note:
+        steps.append(_step("Regulatory override applied", "warn", override_note))
+    steps.append(_step(f"Decision: {decision}", decision_state,
+                       f"routing: {routing}"))
+
     return {
         "risk_score":          risk_score,
         "risk_band":           risk_band,
@@ -1056,6 +1262,10 @@ Write the explanation now:
         "contributing_factors": factors,
         "explanation":         explanation,
         "case_status":         CaseStatus.SCORING,
+        "agent_checklists": [_checklist(
+            "Risk Scoring", "⚖️", steps,
+            f"{decision} — score {risk_score:.3f} ({risk_band})"
+        )],
         "audit_log": [
             f"{_now()} [Risk Score] {risk_score:.3f} ({risk_band}) → "
             f"{decision} via {routing} — "

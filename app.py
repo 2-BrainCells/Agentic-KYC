@@ -10,6 +10,7 @@ human-routed case), and ROCm Telemetry (live MI300X + vLLM metrics).
 
 import os
 import json
+import time
 from datetime import datetime, date
 
 import streamlit as st
@@ -145,6 +146,38 @@ def show_self_correction(audit_log: list) -> None:
         st.success("✅ Autonomously resolved — compliance ambiguity cleared by agent")
 
 
+# How long to pause between each agent's checklist appearing during a live run.
+# Purely cosmetic — makes the "decisions forming" effect watchable in the demo.
+STREAM_STEP_DELAY = 0.6
+
+CHECK_ICON = {"pass": "✅", "fail": "❌", "warn": "⚠️", "info": "•"}
+
+
+def render_checklists(checklists: list) -> None:
+    """
+    Render each agent's step-wise checklist as a bordered card with ✓/✗/⚠ lines.
+    Shared by the live stream during a run and the static results/queue views.
+    """
+    if not checklists:
+        return
+    for cl in checklists:
+        with st.container(border=True):
+            st.markdown(
+                f"**{cl.get('icon','')} {cl.get('agent','')}** "
+                f"<span style='color:#9CA3AF'>— {cl.get('summary','')}</span>",
+                unsafe_allow_html=True,
+            )
+            for s in cl.get("steps", []):
+                icon   = CHECK_ICON.get(s.get("status", "info"), "•")
+                detail = s.get("detail", "")
+                st.markdown(
+                    f"<div class='audit-line'>{icon} {s.get('label','')}"
+                    + (f" — <span style='color:#CBD5E1'>{detail}</span>" if detail else "")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+
 def show_contributing_factors(factors: list) -> None:
     """Render the per-factor risk breakdown as a table."""
     if not factors:
@@ -198,6 +231,11 @@ def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
             st.success(f"💸 Income proof: {iv.get('note')}")
         else:
             st.warning(f"💸 Income proof: {iv.get('note')}")
+
+    checklists = result.get("agent_checklists", [])
+    if checklists:
+        with st.expander("🧠 Agent Decision Checklists (step-by-step)", expanded=True):
+            render_checklists(checklists)
 
     st.markdown("**Contributing Factors**")
     show_contributing_factors(result.get("contributing_factors", []))
@@ -370,9 +408,24 @@ with tab_kyc:
             if father_name:
                 initial["declared"]["father_name"] = father_name
 
+            st.markdown("**🧠 Agents working — decisions forming live**")
+            checklist_ph = st.empty()
+            result = initial
+            seen   = 0
             with st.spinner("🔍 Agents processing — Extraction → ID Verify → "
                             "Compliance → Risk..."):
-                result = get_graph().invoke(initial)
+                # Stream state snapshots so each agent's checklist appears as it
+                # finishes (stream_mode='values' yields the full state per step).
+                for snapshot in get_graph().stream(initial, stream_mode="values"):
+                    result = snapshot
+                    checklists = snapshot.get("agent_checklists", [])
+                    if len(checklists) > seen:
+                        with checklist_ph.container():
+                            render_checklists(checklists)
+                        seen = len(checklists)
+                        time.sleep(STREAM_STEP_DELAY)
+            # Clear the live view — the persistent copy is shown in the results.
+            checklist_ph.empty()
 
             st.session_state.case_result = result
 
