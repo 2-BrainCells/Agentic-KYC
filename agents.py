@@ -30,6 +30,8 @@ from config import (
     RISK_AUTO_APPROVE_BELOW, RISK_REVIEW_BELOW,
     WEIGHT_ID_VERIFICATION, WEIGHT_COMPLIANCE,
     WEIGHT_NETWORK_RISK, WEIGHT_FINANCIAL,
+    ID_PENALTY_NAME, ID_PENALTY_DOB, ID_PENALTY_PIN, ID_PENALTY_ADDRESS,
+    NAME_MATCH_THRESHOLD, ADDRESS_MATCH_THRESHOLD,
     INCOME_BANDS, OCCUPATION_INCOME_MAP,
     TEMP_FIRST_PASS, TEMP_REFINE_PASS, TEMP_EXPLANATION,
     REG_RBI_KYC, REG_PMLA, REG_PAN_AADHAAR,
@@ -86,6 +88,30 @@ def _dob_year(dob: str) -> int:
     """Extract the birth year from a DOB string like '1968-11-14'. 0 if unknown."""
     m = re.search(r"\b(19|20)\d{2}\b", dob or "")
     return int(m.group()) if m else 0
+
+
+def _normalize_dob(dob: str) -> str:
+    """
+    Normalise a DOB into a canonical 'YYYY-MM-DD' string so dates compare
+    regardless of the input format. Handles the two formats in this app:
+    'YYYY-MM-DD' (extraction output / internal) and 'DD-MM-YYYY' or 'DD/MM/YYYY'
+    (Aadhaar-style UI input). Returns the cleaned original if it can't parse.
+    """
+    if not dob:
+        return ""
+    s = dob.strip().replace("/", "-").replace(".", "-")
+    m = re.match(r"^(\d{1,4})-(\d{1,2})-(\d{1,4})$", s)
+    if not m:
+        return s
+    a, b, c = m.groups()
+    if len(a) == 4:                       # already YYYY-MM-DD
+        y, mo, d = a, b, c
+    else:                                 # DD-MM-YYYY → reorder
+        d, mo, y = a, b, c
+    try:
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    except ValueError:
+        return s
 
 
 def _parse_dob_range(dob_range: str) -> tuple:
@@ -334,46 +360,80 @@ def data_extraction_agent(state: KYCState) -> KYCState:
 def id_verification_agent(state: KYCState) -> KYCState:
     """
     Cross-check extracted Aadhaar fields against declared data: fuzzy name
-    match, exact DOB, PIN, UIDAI active status, and PAN-Aadhaar linkage (mocked
-    True). id_verified is True only when name, DOB, and UIDAI all pass with no
-    authenticity flags.
+    match, DOB (format-agnostic), PIN, address, UIDAI active status, and
+    PAN-Aadhaar linkage (mocked True).
+
+    Two outputs:
+      • id_verified (bool) — the HARD gate. True only when name, DOB, PIN,
+        address and UIDAI all pass. A False here auto-rejects the case (the
+        document does not match the declaration → re-apply).
+      • id_risk_score (0.0–1.0) — a GRADED contribution stored in
+        verification_details, so the headline risk score moves smoothly with
+        match quality instead of jumping 0.24 the instant one check flips.
     """
     extracted = state.get("extracted", {})
     declared  = state.get("declared", {})
 
-    # Name
+    # Name — graded similarity, gated at NAME_MATCH_THRESHOLD.
     ext_name  = extracted.get("full_name_english", "") or ""
     dec_name  = declared.get("name", "") or ""
     name_score = _name_similarity(ext_name, dec_name)
-    name_match = name_score >= 0.80
+    name_match = name_score >= NAME_MATCH_THRESHOLD
 
-    # DOB
-    ext_dob = (extracted.get("dob") or "").replace("/", "-").strip()
-    dec_dob = (declared.get("dob") or "").replace("/", "-").strip()
-    dob_match = ext_dob == dec_dob
+    # DOB — normalise both sides so YYYY-MM-DD vs DD-MM-YYYY still compares.
+    ext_dob = _normalize_dob(extracted.get("dob") or "")
+    dec_dob = _normalize_dob(declared.get("dob") or "")
+    dob_present = bool(ext_dob and dec_dob)
+    dob_match = (ext_dob == dec_dob) if dob_present else False
 
-    # Address / PIN
+    # PIN — only checked when both sides are present.
     ext_pin = str(extracted.get("pin_code") or "").strip()
     dec_pin = str(declared.get("pin_code") or "").strip()
-    pin_match = (ext_pin == dec_pin) if (ext_pin and dec_pin) else True
+    pin_present = bool(ext_pin and dec_pin)
+    pin_match = (ext_pin == dec_pin) if pin_present else True
+
+    # Address — graded similarity, gated at ADDRESS_MATCH_THRESHOLD (hard gate).
+    ext_addr = extracted.get("address", "") or ""
+    dec_addr = declared.get("address", "") or ""
+    addr_present = bool(ext_addr.strip() and dec_addr.strip())
+    addr_score = _name_similarity(ext_addr, dec_addr) if addr_present else 1.0
+    addr_match = addr_score >= ADDRESS_MATCH_THRESHOLD
 
     # UIDAI status + PAN-Aadhaar linkage (both mocked in the demo)
     uidai_active = (extracted.get("uidai_status", "ACTIVE") == "ACTIVE")
     pan_linked = True
 
+    # Hard-gate flags — any of these means the identity could not be verified.
     flags = []
-    if name_score < 0.60:
-        flags.append(f"Name mismatch: declared '{dec_name}' vs extracted '{ext_name}' (score {name_score})")
-    if not dob_match and ext_dob and dec_dob:
+    if not name_match:
+        flags.append(f"Name mismatch: declared '{dec_name}' vs extracted '{ext_name}' (score {name_score:.2f})")
+    if dob_present and not dob_match:
         flags.append(f"DOB mismatch: declared '{dec_dob}' vs extracted '{ext_dob}'")
+    if pin_present and not pin_match:
+        flags.append(f"PIN mismatch: declared '{dec_pin}' vs extracted '{ext_pin}'")
+    if addr_present and not addr_match:
+        flags.append(f"Address mismatch: declared '{dec_addr}' vs extracted '{ext_addr}' (score {addr_score:.2f})")
     if not uidai_active:
         flags.append("UIDAI status is not ACTIVE — Aadhaar may be suspended")
 
-    id_verified = name_match and dob_match and uidai_active and not flags
+    id_verified = (
+        name_match and dob_match and pin_match and addr_match
+        and uidai_active and not flags
+    )
+
+    # Graded ID risk contribution (0.0 = perfect match, up to 1.0).
+    id_risk_score = round(min(1.0,
+        ID_PENALTY_NAME    * max(0.0, 1.0 - name_score) +
+        ID_PENALTY_DOB     * (0.0 if dob_match  else 1.0) +
+        ID_PENALTY_PIN     * (0.0 if pin_match  else 1.0) +
+        ID_PENALTY_ADDRESS * max(0.0, 1.0 - addr_score)
+    ), 3)
 
     reasons = []
     reasons.append(f"Name: {'✓' if name_match else '✗'} score {name_score:.2f} — '{dec_name}' vs '{ext_name}'")
-    reasons.append(f"DOB: {'✓' if dob_match else '✗'} declared {dec_dob} vs extracted {ext_dob}")
+    reasons.append(f"DOB: {'✓' if dob_match else '✗'} declared {dec_dob or '—'} vs extracted {ext_dob or '—'}")
+    reasons.append(f"Address: {'✓' if addr_match else '✗'} score {addr_score:.2f}")
+    reasons.append(f"PIN: {'✓' if pin_match else '✗'} declared {dec_pin or '—'} vs extracted {ext_pin or '—'}")
     reasons.append(f"UIDAI status: {'✓ ACTIVE' if uidai_active else '✗ NOT ACTIVE'}")
     reasons.append(f"PAN-Aadhaar linked: {'✓' if pan_linked else '✗'} (per {REG_PAN_AADHAAR})")
 
@@ -382,9 +442,11 @@ def id_verification_agent(state: KYCState) -> KYCState:
                                 "note": f"'{dec_name}' vs '{ext_name}'"},
         "dob_match":           dob_match,
         "pin_match":           pin_match,
+        "address_match":       {"result": addr_match, "score": addr_score},
         "uidai_active":        uidai_active,
         "pan_aadhaar_linked":  pan_linked,
         "authenticity_flags":  flags,
+        "id_risk_score":       id_risk_score,
         "reasons":             reasons,
     }
 
@@ -393,10 +455,10 @@ def id_verification_agent(state: KYCState) -> KYCState:
         "verification_details": details,
         "case_status":        CaseStatus.VERIFYING,
         "audit_log": [
-            f"{_now()} [ID Verify] verified={id_verified} — "
-            f"name score={name_score:.2f}, DOB={'✓' if dob_match else '✗'}, "
+            f"{_now()} [ID Verify] verified={id_verified} (id_risk={id_risk_score:.2f}) — "
+            f"name={name_score:.2f}, DOB={'✓' if dob_match else '✗'}, "
+            f"PIN={'✓' if pin_match else '✗'}, addr={addr_score:.2f}, "
             f"UIDAI={'ACTIVE' if uidai_active else 'INACTIVE'}, "
-            f"PAN linked={'✓' if pan_linked else '✗'}, "
             f"flags={len(flags)}"
         ],
     }
@@ -839,7 +901,12 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
 
     # Per-factor raw scores. A loop-exonerated case keeps a 0.25 residual — it
     # was ambiguous enough to investigate, so it never scores like a never-flagged case.
-    id_score   = 0.0 if id_ok else 0.80
+    #
+    # ID is GRADED: the verification agent's id_risk_score moves smoothly with
+    # match quality (0.0 = perfect) instead of a 0.0/0.80 cliff. A hard
+    # verification failure still auto-rejects below via an override.
+    verification = state.get("verification_details", {})
+    id_score   = verification.get("id_risk_score", 0.0 if id_ok else 0.80)
     comp_score = (
         (0.25 if resolved_via_loop else 0.0)
              if comp_status == ScreeningStatus.CLEAR else
@@ -880,6 +947,18 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
         risk_band = RiskBand.HIGH
         routing   = Routing.ROUTE_TO_HUMAN
         override_note = "OVERRIDE: confirmed watchlist hit → REJECT (PMLA)"
+    elif not id_ok:
+        # The document does not match the declared data (or could not be
+        # verified). We cannot establish identity → auto-reject and ask the
+        # customer to re-apply with correct documents. Ends without a human.
+        decision  = Decision.REJECT
+        risk_band = RiskBand.HIGH
+        routing   = Routing.AUTO_REJECT
+        flag_list = "; ".join(verification.get("authenticity_flags", [])) or "identity could not be verified"
+        override_note = (
+            f"OVERRIDE: identity verification FAILED ({flag_list}) → "
+            f"REJECT — customer must re-apply with matching documents"
+        )
     elif decision == Decision.APPROVE and comp_status != ScreeningStatus.CLEAR:
         decision  = Decision.REVIEW
         routing   = Routing.ROUTE_TO_HUMAN
@@ -897,8 +976,12 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
             "factor":             "ID Verification",
             "weight":             WEIGHT_ID_VERIFICATION,
             "score_contribution": round(id_score * WEIGHT_ID_VERIFICATION, 3),
-            "evidence":           "PASS — Aadhaar QR valid, UIDAI active, PAN-Aadhaar linked"
-                                  if id_ok else "FAIL — identity verification did not pass",
+            "evidence":           (
+                "PASS — name, DOB, PIN and address match; UIDAI active, PAN-Aadhaar linked"
+                if id_ok else
+                "FAIL — " + ("; ".join(verification.get("authenticity_flags", []))
+                             or "identity could not be verified")
+            ),
         },
         {
             "factor":             "Compliance Screening",

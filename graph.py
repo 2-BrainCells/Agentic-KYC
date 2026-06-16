@@ -44,9 +44,14 @@ def route_after_compliance(state: KYCState) -> str:
 
 
 def route_after_risk(state: KYCState) -> str:
-    """AUTO_APPROVE → 'auto' (END); anything else → 'human' (review queue)."""
+    """
+    Terminal routings end the graph; only ROUTE_TO_HUMAN goes to the queue.
+    AUTO_APPROVE → 'auto' (END). AUTO_REJECT (e.g. failed ID verification) →
+    'auto' (END) too — the customer is told to re-apply, no officer needed.
+    Everything else → 'human' (review queue).
+    """
     routing = state.get("routing", Routing.ROUTE_TO_HUMAN)
-    if routing == Routing.AUTO_APPROVE:
+    if routing in (Routing.AUTO_APPROVE, Routing.AUTO_REJECT):
         return "auto"
     return "human"
 

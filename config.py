@@ -16,7 +16,7 @@ VLLM_TIMEOUT    = 60                     # seconds per request
 VLLM_MAX_TOKENS = 1024                   # max tokens per agent response
 
 # Per-task temperatures (do not change without good reason)
-TEMP_FIRST_PASS   = 0.2   # conservative — standard extraction
+TEMP_FIRST_PASS   = 0.0   # greedy — deterministic standard extraction (same image → same fields → same score)
 TEMP_REFINE_PASS  = 0.7   # higher — surfaces hard-to-read fields on retry
 TEMP_AGENT_LOGIC  = 0.1   # near-zero — compliance/financial decisions
 TEMP_EXPLANATION  = 0.4   # some creativity — NL explanation paragraph
@@ -56,6 +56,22 @@ WEIGHT_ID_VERIFICATION  = 0.30
 WEIGHT_COMPLIANCE       = 0.40
 WEIGHT_NETWORK_RISK     = 0.20
 WEIGHT_FINANCIAL        = 0.10
+
+
+# ── ID-verification sub-checks ──────────────────────────────────────────────
+# The ID factor is GRADED (not pass/fail-binary) so small OCR/extraction noise
+# moves the risk score by a little, not by a 0.24 cliff. These sub-weights are
+# how much each failed check adds to the ID risk contribution (capped at 1.0).
+ID_PENALTY_NAME      = 0.40   # name similarity below NAME_MATCH_THRESHOLD
+ID_PENALTY_DOB       = 0.30   # DOB does not match
+ID_PENALTY_PIN       = 0.15   # PIN code does not match
+ID_PENALTY_ADDRESS   = 0.15   # address does not match (hard gate, see below)
+
+# Hard gates: any of these failing blocks auto-approval. A failed identity
+# check means the document does not match the declared data → the case is
+# auto-rejected and the customer is asked to re-apply with correct documents.
+NAME_MATCH_THRESHOLD    = 0.80   # extracted vs declared name similarity to pass
+ADDRESS_MATCH_THRESHOLD = 0.70   # extracted vs declared address similarity to pass
 
 
 # ── Indian income bands (INR per annum) ────────────────────────────────────

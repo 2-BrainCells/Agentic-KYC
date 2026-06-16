@@ -67,6 +67,7 @@ class Routing:
     """How the risk agent routes the case after scoring."""
     AUTO_APPROVE    = "AUTO_APPROVE"
     ROUTE_TO_HUMAN  = "ROUTE_TO_HUMAN"
+    AUTO_REJECT     = "AUTO_REJECT"   # hard fail (e.g. ID not verified) → end, ask to reapply
 
 
 class DecisionSource:

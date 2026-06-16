@@ -10,7 +10,7 @@ human-routed case), and ROCm Telemetry (live MI300X + vLLM metrics).
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date
 
 import streamlit as st
 import pandas as pd
@@ -299,7 +299,14 @@ with tab_kyc:
         st.markdown("**Declared Information**")
         c1, c2 = st.columns(2)
         name        = c1.text_input("Full Name *")
-        dob         = c2.text_input("Date of Birth *  (YYYY-MM-DD)")
+        dob_date    = c2.date_input(
+            "Date of Birth *  (DD-MM-YYYY)",
+            value=None,                       # start empty — officer must pick
+            min_value=date(1900, 1, 1),
+            max_value=date.today(),
+            format="DD-MM-YYYY",              # display as on the Aadhaar card
+            help="As printed on the Aadhaar card. Stored internally as an ISO date.",
+        )
         address     = st.text_input("Residential Address")
         c3, c4      = st.columns(2)
         pin_code    = c3.text_input("PIN Code")
@@ -331,6 +338,8 @@ with tab_kyc:
         st.subheader("KYC Decision")
 
         if run_btn:
+            # date_input returns a date object (or None); store canonical ISO.
+            dob = dob_date.isoformat() if dob_date else ""
             if not name or not dob:
                 st.error("Please enter at least the customer's name and date of birth.")
                 st.stop()
@@ -392,13 +401,33 @@ with tab_kyc:
 
             st.divider()
             if closed_rec:
-                hd    = result.get("human_decision") or {}
-                final = result.get("final_decision", result.get("decision", ""))
-                st.success(
-                    f"🧑‍⚖️ **Officer decision recorded** — final decision "
-                    f"**{final}** by `{hd.get('officer_id','')}` "
-                    f"(case `{queued_id}` closed)."
+                hd     = result.get("human_decision") or {}
+                final  = result.get("final_decision", result.get("decision", ""))
+                cname  = (result.get("declared") or {}).get("name", "the applicant")
+                when   = result.get("closed_at") or hd.get("reviewed_at", "")
+                st.markdown(
+                    f"<div style='margin:6px 0'>Final decision: "
+                    f"{decision_badge(final)}</div>", unsafe_allow_html=True,
                 )
+                st.success(
+                    f"🧑‍⚖️ **Review complete for {cname}** — officer "
+                    f"`{hd.get('officer_id','')}` recorded a **{final.replace('_',' ')}** "
+                    f"decision and the case (`{queued_id}`) is now closed"
+                    + (f" · {when}" if when else "") + "."
+                )
+                if hd.get("rationale"):
+                    st.caption(f"📝 Officer rationale: {hd['rationale']}")
+            elif (result.get("decision") == Decision.REJECT
+                  and result.get("routing") == Routing.AUTO_REJECT):
+                st.error(
+                    "⛔ **Application rejected — identity could not be verified.** "
+                    "The submitted Aadhaar does not match the declared details, so "
+                    "we cannot establish the applicant's identity. Please re-apply "
+                    "with a document whose name, date of birth, PIN and address "
+                    "match the information entered."
+                )
+                for f in (result.get("verification_details") or {}).get("authenticity_flags", []):
+                    st.caption(f"• {f}")
             elif result.get("routing") == Routing.ROUTE_TO_HUMAN:
                 st.warning(
                     "⚠ **Human review required** — this case was added to the "
