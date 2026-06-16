@@ -1,22 +1,14 @@
 """
-tools.py — External Tool Calls
-================================
-Next file after config.py. Every agent imports from here.
+tools.py — External tool calls used by the agents.
 
-Install dependencies first (run once in your notebook terminal):
-    pip install openai pytesseract pillow qdrant-client[fastembed]
-    sudo apt-get install -y tesseract-ocr tesseract-ocr-hin
+Three groups: LLM tools (vLLM text + JSON), document tools (Tesseract OCR +
+field parsing), and sanctions tools (Qdrant vector search with deterministic
+scoring, plus local-scan and LLM-as-judge fallbacks). Every function is
+wrapped in try/except — a tool failure returns a safe default and logs it, it
+never crashes the pipeline.
 
-    tesseract-ocr     → reads English text from Aadhaar card
-    tesseract-ocr-hin → reads Devanagari (Hindi) text from Aadhaar card
-
-Three tool groups:
-  1. LLM Tools     → calls vLLM for text generation and JSON extraction
-  2. Document Tools → OCR on Aadhaar card + structured field parsing
-  3. Sanctions Tools → Qdrant semantic search + LLM-as-judge fallback
-
-All functions have try/except — they NEVER crash the demo.
-On failure they return a safe default and log the error.
+Setup once: pip install openai pytesseract pillow qdrant-client[fastembed]
+            apt-get install -y tesseract-ocr tesseract-ocr-hin
 """
 
 import atexit
@@ -40,34 +32,24 @@ from config import (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CLIENTS  —  created once, reused across all calls
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Clients (created once, reused) ──────────────────────────────────────────
 
-# vLLM — OpenAI-compatible endpoint running Llama-3 on your MI300X
+# vLLM — OpenAI-compatible endpoint running Llama-3 on the MI300X.
 llm_client = OpenAI(
     base_url = VLLM_API_BASE,
     api_key  = VLLM_API_KEY,
 )
 
-# Qdrant — stores your mock sanctions list as embeddings.
-# Embedded local mode: data lives in QDRANT_LOCAL_PATH on disk, no server.
-# Only one process can hold this folder at a time — every module must reuse
-# THIS client (import it from tools), never create a second QdrantClient.
+
 def _make_qdrant_client():
     """
-    Open the embedded Qdrant store, but NEVER crash the app if we can't.
+    Open the embedded Qdrant store without ever crashing the app.
 
-    Local mode takes an EXCLUSIVE file lock on QDRANT_LOCAL_PATH. If a previous
-    Streamlit run, a leftover notebook kernel, or the setup script still holds
-    that folder, the constructor raises:
-        RuntimeError: Storage folder ... already accessed by another instance
-    That used to take down the whole app on import (the traceback the team
-    hit). Instead we fall back to an in-memory client: sanctions screening
-    still works, because query_sanctions_db() degrades to the deterministic
-    local_sanctions_scan() (it reads sanctions_list.json straight off disk).
-    The only thing lost is cross-session persistence of the exception cache —
-    acceptable for the demo. Close the other process to restore vector search.
+    Local mode takes an exclusive lock on QDRANT_LOCAL_PATH. If another process
+    holds it, fall back to an in-memory client — sanctions screening still works
+    because query_sanctions_db() degrades to the on-disk fuzzy scan. Only
+    cross-session persistence of the exception cache is lost. Returns None only
+    if even the in-memory client fails.
     """
     try:
         return QdrantClient(path=QDRANT_LOCAL_PATH)
@@ -88,16 +70,12 @@ def _make_qdrant_client():
 
 qdrant_client = _make_qdrant_client()
 
-# Close the embedded client cleanly at process exit — without this Python
-# prints a harmless-but-scary "__del__ ... sys.meta_path is None" traceback
-# during interpreter shutdown.
+# Close the embedded client at exit to avoid a noisy shutdown traceback.
 if qdrant_client is not None:
     atexit.register(qdrant_client.close)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GROUP 1 — LLM TOOLS
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Group 1: LLM tools ──────────────────────────────────────────────────────
 
 def call_text_llm(
     prompt:        str,
@@ -105,23 +83,9 @@ def call_text_llm(
     system_prompt: str   = "You are a precise KYC compliance assistant.",
 ) -> str:
     """
-    Sends a prompt to vLLM and returns the model's text response.
-    Used by every agent for reasoning, decisions, and explanations.
+    Send a prompt to vLLM and return the model's text response.
 
-    Args:
-        prompt:        What you want the model to do.
-        temperature:   0.1 = very precise.  0.7 = more creative.
-        system_prompt: Gives the model its role context.
-
-    Returns:
-        The model's response as a plain string.
-        Returns "[LLM unavailable]" if the server is down — demo safe.
-
-    Example:
-        response = call_text_llm(
-            prompt      = "Is 'Priya Sharma' a common Indian name? Answer yes or no.",
-            temperature = 0.1,
-        )
+    Returns "[LLM unavailable]" if the server is unreachable (demo-safe).
     """
     try:
         response = llm_client.chat.completions.create(
@@ -149,30 +113,16 @@ def call_llm_for_json(
                            "No extra text, no markdown, no explanation outside the JSON.",
 ) -> dict:
     """
-    Sends a prompt to vLLM and parses the response as JSON.
-    Used when an agent needs structured data back (not free text).
+    Send a prompt to vLLM and parse the response as JSON.
 
-    Handles three common failure modes:
-      - Model wraps JSON in ```json ... ``` fences → strips them
-      - Model adds text before/after the JSON → extracts the JSON block
-      - Model returns invalid JSON → returns {}
-
-    Returns:
-        Parsed dict, or {} on any failure.
-
-    Example:
-        result = call_llm_for_json(
-            prompt = "Extract name and DOB from this text as JSON: ..."
-        )
-        name = result.get("full_name", "UNKNOWN")
+    Strips ```json fences and any text before the first { or [. Returns {} on
+    any parse failure.
     """
     raw = call_text_llm(prompt, temperature, system_prompt)
 
-    # Strip markdown code fences if present: ```json ... ```
+    # Strip markdown code fences, then any leading prose before the JSON.
     raw = re.sub(r"```(?:json)?", "", raw).strip()
     raw = raw.strip("`").strip()
-
-    # If there is text before the JSON, find the first { or [
     json_start = min(
         raw.find("{") if "{" in raw else len(raw),
         raw.find("[") if "[" in raw else len(raw),
@@ -187,28 +137,16 @@ def call_llm_for_json(
         return {}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GROUP 2 — DOCUMENT TOOLS  (Aadhaar OCR + structured field parsing)
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Group 2: Document tools (Aadhaar OCR + field parsing) ───────────────────
 
 def extract_text_from_image(image_path: str) -> str:
     """
-    Runs OCR on the Aadhaar card image using Tesseract.
-    Reads both English and Hindi (Devanagari) text.
+    OCR an Aadhaar card image with Tesseract (English + Devanagari).
 
-    Args:
-        image_path: Path to the Aadhaar card image file.
-
-    Returns:
-        Raw text extracted from the image.
-        Returns "" on failure — agents handle this gracefully.
-
-    Requires:
-        sudo apt-get install tesseract-ocr tesseract-ocr-hin
+    Returns "" on failure. Requires tesseract-ocr and tesseract-ocr-hin.
     """
     try:
         img  = Image.open(image_path)
-        # "eng+hin" tells Tesseract to read English AND Devanagari
         text = pytesseract.image_to_string(img, lang="eng+hin")
         return text.strip()
 
@@ -223,39 +161,12 @@ def parse_aadhaar_fields(
     temperature: float = TEMP_FIRST_PASS,
 ) -> dict:
     """
-    Sends the raw OCR text to Llama-3 and asks it to extract
-    Aadhaar identity fields as structured JSON.
+    Ask Llama-3 to turn raw Aadhaar OCR text into structured identity fields.
 
-    Two modes (controlled by `directive`):
-      "standard_first_pass" — extract all standard fields
-      "refinement_pass"     — focus on father's name (care_of field),
-                              middle name, place of birth
-
-    Args:
-        ocr_text:    Raw text from extract_text_from_image().
-        directive:   Which fields to prioritise.
-        temperature: Use TEMP_FIRST_PASS normally, TEMP_REFINE_PASS on retry.
-
-    Returns:
-        Dict of extracted identity fields. Missing fields are null.
-
-    Example return value:
-        {
-          "full_name_english":    "PRIYA SHARMA",
-          "full_name_devanagari": "प्रिया शर्मा",
-          "given_name":           "PRIYA",
-          "surname":              "SHARMA",
-          "father_name":          null,
-          "dob":                  "1992-09-08",
-          "gender":               "F",
-          "aadhaar_last4":        "7823",
-          "address":              "B-204 Green Park Bengaluru Karnataka",
-          "pin_code":             "560034",
-          "pan_number":           null,
-          "extraction_pass":      0
-        }
+    directive "standard_first_pass" extracts all fields; "refinement_pass"
+    focuses on the father's name (QR 'care_of'), middle name, and place of
+    birth. Returns a safe all-null structure if the LLM returns nothing.
     """
-    # Choose the right instruction based on which pass this is
     if directive == "refinement_pass":
         focus = (
             "This is a REFINEMENT pass. The first extraction missed the father's "
@@ -312,7 +223,6 @@ Do not add any text outside the JSON.
 
     result = call_llm_for_json(prompt, temperature=temperature)
 
-    # If LLM returned empty dict, return a safe structure
     if not result:
         return {
             "full_name_english": None, "full_name_devanagari": None,
@@ -328,12 +238,9 @@ Do not add any text outside the JSON.
 
 def compute_field_confidence(extracted: dict) -> dict:
     """
-    Assigns a confidence score (0.0 – 1.0) to each extracted field.
-    Simple heuristic: None / empty = 0.0, populated = 0.85 – 0.99.
-
-    Used by the Streamlit UI to colour-code bounding boxes:
-      score >= 0.75 → green box
-      score  < 0.75 → amber/red box (flagged for human review)
+    Heuristic confidence (0.0–1.0) per extracted field: empty = 0.0, numeric/
+    format-checkable fields = 0.97, text fields = 0.87. Drives the UI overlay
+    colour (>= 0.75 green, otherwise amber/red).
     """
     confidence = {}
     high_confidence_fields = {
@@ -343,31 +250,21 @@ def compute_field_confidence(extracted: dict) -> dict:
         if value is None or value == "":
             confidence[field] = 0.0
         elif field in high_confidence_fields:
-            confidence[field] = 0.97   # these are numeric / format-checkable
+            confidence[field] = 0.97
         else:
-            confidence[field] = 0.87   # text fields — moderate confidence
+            confidence[field] = 0.87
 
     return confidence
 
 
 def parse_salary_slip(image_path: str) -> dict:
     """
-    OCR a salary slip / income proof and pull out the pay figure, so the
-    financial agent can VERIFY the customer's declared income against an
-    actual document instead of just trusting the form.
+    OCR a salary slip and extract the pay figure so the financial agent can
+    verify declared income against a document.
 
-    Returns:
-        {
-          "monthly_income": float | None,   # best available monthly figure
-          "annual_income":  float | None,   # monthly × 12
-          "employer":       str   | None,
-          "raw_found":      bool,            # True only if a number was parsed
-        }
-
-    Safe on every failure path — no file, OCR empty, LLM down, bad number —
-    returns raw_found=False so the financial agent simply skips verification.
-    Only ever runs when a slip is actually uploaded, so it never changes the
-    behaviour of the canonical demo customers or the bulk profiles (no slip).
+    Returns {monthly_income, annual_income, employer, raw_found}. Safe on every
+    failure path (missing file, empty OCR, LLM down, bad number) — raw_found is
+    then False and the financial agent simply skips verification.
     """
     result = {"monthly_income": None, "annual_income": None,
               "employer": None, "raw_found": False}
@@ -416,32 +313,17 @@ Return ONLY this JSON (use null if a value is not present):
         return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GROUP 3 — SANCTIONS TOOLS
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Group 3: Sanctions tools ────────────────────────────────────────────────
 
 def _sanctions_match_score(query_name: str, entry_name: str, aliases: list = None) -> float:
     """
     Deterministic 0.0–1.0 name-match score between a customer name and a
-    watchlist entry (including its aliases).
+    watchlist entry (including aliases).
 
-    Blend of two signals (50/50):
-      - token overlap: shared name components / total components
-        ("Vikram Malhotra" vs "Vikram Suresh Malhotra" → 2 of 3 tokens)
-      - difflib character similarity on the full strings
-
-    Why deterministic instead of embedding cosine: the screening thresholds in
-    config.py (0.60 / 0.85) are calibrated against THIS scale. Embedding scores
-    drift with model choice; this never does — same result on a laptop and on
-    the MI300X. What to do with this: call it with the entry's name and aliases,
-    take the best score across query variants.
-
-    Alias matches are capped at 0.81: an AKA on a watchlist is reported
-    intelligence, not a verified legal name, so even an exact alias match
-    stays in the AMBIGUOUS band and needs more identity signals (father's
-    name, DOB) before it can confirm. This is what arms the self-correction
-    loop — "Vikram Malhotra" hits the alias of "Vikram Suresh Malhotra" at
-    exactly 0.81, not 1.0.
+    A 50/50 blend of token overlap and difflib character similarity. Kept
+    deterministic so the config thresholds (0.60/0.85) always mean the same
+    thing on any machine. Alias matches are capped at 0.81 so even an exact AKA
+    stays in the AMBIGUOUS band — this is what arms the self-correction loop.
     """
     import difflib
 
@@ -465,7 +347,7 @@ def _sanctions_match_score(query_name: str, entry_name: str, aliases: list = Non
 
 
 def _entry_to_match(entry: dict, score: float) -> dict:
-    """Formats a sanctions-list entry as a standard match dict for the agents."""
+    """Format a sanctions-list entry as the standard match dict agents expect."""
     return {
         "matched_name": entry.get("name", "Unknown"),
         "match_score":  round(score, 3),
@@ -479,7 +361,7 @@ def _entry_to_match(entry: dict, score: float) -> dict:
 
 
 def _load_sanctions_list() -> list:
-    """Loads the mock sanctions JSON from disk. Returns [] if missing."""
+    """Load the mock sanctions JSON from disk. Returns [] if missing/unreadable."""
     try:
         if not os.path.exists(SANCTIONS_LIST_PATH):
             print(f"[tools] Sanctions list not found at {SANCTIONS_LIST_PATH}")
@@ -493,10 +375,9 @@ def _load_sanctions_list() -> list:
 
 def local_sanctions_scan(name: str, name_variants: list = None) -> list:
     """
-    FALLBACK: deterministic fuzzy scan of the sanctions JSON on disk.
-    Needs no Qdrant and no LLM — always available, always the same answer.
-    Used when Qdrant is down (e.g. running the pipeline on a laptop).
-    Returns the same format as query_sanctions_db().
+    Fallback: deterministic fuzzy scan of the sanctions JSON on disk. Needs no
+    Qdrant and no LLM, so it is always available with the same answer. Returns
+    the same format as query_sanctions_db().
     """
     sanctions = _load_sanctions_list()
     if not sanctions:
@@ -523,39 +404,18 @@ def query_sanctions_db(
     top_k:         int  = QDRANT_TOP_K,
 ) -> list:
     """
-    Searches the Qdrant sanctions database for names similar to the input.
-    Uses semantic/vector search — finds fuzzy matches across spelling variants.
+    Search the Qdrant sanctions DB for similar names.
 
-    Args:
-        name:          The customer's full name.
-        name_variants: Extra forms of the name (Devanagari, inverted, etc.)
-        top_k:         How many nearest matches to return.
-
-    Returns:
-        List of matches, each with name, score, and list source.
-        Returns [] on any failure (Qdrant down, collection missing, etc.)
-
-    Example return:
-        [
-          {
-            "matched_name": "Vikram Suresh Malhotra",
-            "match_score":  0.81,
-            "list_source":  "ED — PMLA Case No. 2019/DEL/0147",
-            "aliases":      ["V.S. Malhotra", "Vikram Malhotra"],
-            "dob_range":    "1966–1970"
-          }
-        ]
+    Qdrant retrieves candidates across spelling/script variants; the
+    deterministic scorer assigns the calibrated match_score. Falls back to the
+    local fuzzy scan, then to LLM-as-judge, if Qdrant is unavailable. Returns []
+    on total failure.
     """
     try:
-        # Build a combined query from all name variants
         query_text = name
         if name_variants:
             query_text = " | ".join([name] + name_variants)
 
-        # Qdrant with fastembed — handles the embedding automatically.
-        # Vector search RETRIEVES the candidates (spelling/script variants);
-        # the deterministic scorer then assigns the calibrated match_score,
-        # so the 0.60/0.85 thresholds in config.py always mean the same thing.
         results = qdrant_client.query(
             collection_name = QDRANT_COLLECTION_NAME,
             query_text      = query_text,
@@ -565,15 +425,14 @@ def query_sanctions_db(
         queries = [q for q in [name] + (name_variants or []) if q]
         matches = []
         for r in results:
-            # fastembed's query() returns QueryResponse objects — the stored
-            # sanctions entry lives in .metadata (not .payload)
+            # fastembed query() returns the stored entry in .metadata
             entry = r.metadata or {}
             score = max(
                 (_sanctions_match_score(q, entry.get("name", ""), entry.get("aliases"))
                  for q in queries),
                 default=0.0,
             )
-            if score >= FUZZY_CLEAR_BELOW:          # only return meaningful matches
+            if score >= FUZZY_CLEAR_BELOW:
                 match = _entry_to_match(entry, score)
                 match["retrieval_score"] = round(r.score, 3)   # raw vector similarity
                 matches.append(match)
@@ -586,7 +445,6 @@ def query_sanctions_db(
         local = local_sanctions_scan(name, name_variants)
         if local or os.path.exists(SANCTIONS_LIST_PATH):
             return local
-        # Last resort — no Qdrant AND no local file: ask the LLM directly
         return llm_sanctions_check(name, name_variants)
 
 
@@ -595,16 +453,11 @@ def llm_sanctions_check(
     name_variants: list = None,
 ) -> list:
     """
-    FALLBACK: uses Llama-3 directly to check if a name appears on
-    the sanctions list (loaded from your JSON file).
-
-    Used when Qdrant is unavailable or not yet set up.
-    This is the LLM-as-judge approach — no embeddings needed.
-
-    Returns same format as query_sanctions_db().
+    Fallback: LLM-as-judge sanctions check. Loads the JSON list and asks Llama-3
+    to compare the customer name against each entry. Used only when Qdrant and
+    the local scan are both unavailable. Returns the query_sanctions_db() format.
     """
     try:
-        # Load the mock sanctions list from disk
         if not os.path.exists(SANCTIONS_LIST_PATH):
             print(f"[tools] Sanctions list not found at {SANCTIONS_LIST_PATH}")
             return []
@@ -612,11 +465,10 @@ def llm_sanctions_check(
         with open(SANCTIONS_LIST_PATH, "r", encoding="utf-8") as f:
             sanctions = json.load(f)
 
-        # Format as a readable list for the LLM
         sanctions_text = "\n".join([
             f"- {e.get('name')} | DOB: {e.get('dob_range','?')} | "
             f"Case: {e.get('case_ref','?')} | List: {e.get('list_source','?')}"
-            for e in sanctions[:50]   # cap at 50 to stay within context window
+            for e in sanctions[:50]   # cap to stay within context window
         ])
 
         all_names = [name] + (name_variants or [])
@@ -656,7 +508,6 @@ Format:
 """
         result = call_llm_for_json(prompt, temperature=TEMP_AGENT_LOGIC)
 
-        # Result could be a list or a dict with a list inside
         if isinstance(result, list):
             return result
         if isinstance(result, dict):
@@ -673,13 +524,9 @@ def check_exception_cache(
     dob:  str,
 ) -> dict | None:
     """
-    Checks the Human Exception Cache in Qdrant.
-    If a compliance officer has already reviewed a similar case,
-    return their decision so the system can learn from it.
-
-    Returns:
-        {"decision": "APPROVE_WITH_EDD", "rationale": "..."} if found.
-        None if no matching prior case.
+    Look up the Human Exception Cache in Qdrant for a prior officer decision on
+    a similar profile. Returns the cached decision dict if a >0.90 match exists,
+    else None (also None if the cache collection does not exist yet).
     """
     try:
         results = qdrant_client.query(
@@ -691,27 +538,20 @@ def check_exception_cache(
             return results[0].metadata
         return None
     except Exception:
-        # Cache not set up yet — that is fine, return None
         return None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SETUP HELPER  —  run this ONCE to ingest your sanctions list into Qdrant
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Setup helper — run ONCE to ingest the sanctions list into Qdrant ────────
 
 def setup_sanctions_collection() -> bool:
     """
-    Creates the Qdrant collection and ingests your mock sanctions list.
-    Run this ONCE before starting the demo (add a cell in 00_setup.ipynb).
+    Create the Qdrant collection and ingest the mock sanctions list. Run once
+    before the demo (e.g. in 00_setup.ipynb). Returns True on success.
 
-    Returns True on success, False on failure.
-
-    Usage in 00_setup.ipynb:
-        from tools import setup_sanctions_collection
-        setup_sanctions_collection()
+    Note: the collection is NOT pre-created — qdrant_client.add() creates it
+    with the named-vector config fastembed expects.
     """
     try:
-        # Load your mock sanctions JSON
         if not os.path.exists(SANCTIONS_LIST_PATH):
             print(f"[setup] ⚠ Sanctions file not found: {SANCTIONS_LIST_PATH}")
             return False
@@ -719,18 +559,13 @@ def setup_sanctions_collection() -> bool:
         with open(SANCTIONS_LIST_PATH, "r", encoding="utf-8") as f:
             sanctions = json.load(f)
 
-        # Delete any existing collection (idempotent — safe to re-run).
-        # Do NOT pre-create it: qdrant_client.add() below creates the
-        # collection itself with the NAMED vector config that fastembed
-        # expects. A manually created unnamed 384-dim vector clashes with
-        # it and raises "Collection have incompatible vector params".
+        # Idempotent — drop an existing collection so re-runs are safe.
         existing = [c.name for c in qdrant_client.get_collections().collections]
         if QDRANT_COLLECTION_NAME in existing:
             qdrant_client.delete_collection(QDRANT_COLLECTION_NAME)
             print(f"[setup] Deleted existing collection '{QDRANT_COLLECTION_NAME}'")
 
-        # Ingest each sanctions entry
-        # fastembed will embed the 'document' text for semantic search
+        # fastembed embeds the 'documents' text for semantic search.
         qdrant_client.add(
             collection_name = QDRANT_COLLECTION_NAME,
             documents       = [
@@ -750,16 +585,14 @@ def setup_sanctions_collection() -> bool:
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SANITY CHECK  —  run this file directly to test all connections
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Sanity check — run this file directly to test all connections ──────────
 
 if __name__ == "__main__":
     print("=" * 60)
     print("tools.py — Connection Sanity Check")
     print("=" * 60)
 
-    # 1. Test vLLM
+    # 1. vLLM
     print("\n1. Testing vLLM connection...")
     try:
         response = call_text_llm(
@@ -773,7 +606,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"   ❌ vLLM error: {e}")
 
-    # 2. Test JSON extraction
+    # 2. JSON extraction
     print("\n2. Testing JSON extraction from LLM...")
     result = call_llm_for_json(
         prompt = 'Return this exact JSON: {"status": "ok", "system": "KYC"}'
@@ -783,7 +616,7 @@ if __name__ == "__main__":
     else:
         print(f"   ⚠ JSON extraction returned: {result}")
 
-    # 3. Test Tesseract OCR
+    # 3. Tesseract OCR
     print("\n3. Testing Tesseract OCR...")
     try:
         import pytesseract
@@ -797,7 +630,7 @@ if __name__ == "__main__":
         print(f"   ❌ Tesseract not installed: {e}")
         print("      Fix: sudo apt-get install tesseract-ocr tesseract-ocr-hin")
 
-    # 4. Test Qdrant
+    # 4. Qdrant
     print("\n4. Testing Qdrant connection...")
     try:
         info = qdrant_client.get_collections()

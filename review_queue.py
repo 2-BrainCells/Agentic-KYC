@@ -1,34 +1,14 @@
 """
-review_queue.py — Persistent Human Review Inbox (the officer dashboard store)
-=============================================================================
-Cases the pipeline routes to a human (routing == ROUTE_TO_HUMAN) are written
-here so a compliance officer can work through them later — whether they came
-from a single-customer run on the KYC Pipeline tab OR from the Bulk Import
-stress test. Backed by a JSON file on disk (config.REVIEW_QUEUE_PATH) so the
-inbox survives app restarts; Streamlit session state alone does not.
+review_queue.py — Persistent human review inbox (the officer dashboard store).
 
-This module is PURE STORAGE. It deliberately imports nothing from graph.py /
-agents.py, so it can never create an import cycle (§5 of CLAUDE.md). The flow
-the UI uses:
+Cases the pipeline routes to a human (routing == ROUTE_TO_HUMAN) are written to
+a JSON file (config.REVIEW_QUEUE_PATH) so a compliance officer can work through
+them later, whether they came from a single run or the bulk import. The file
+backing means the inbox survives app restarts.
 
-    from review_queue import enqueue_case, list_cases, close_case
-    from graph        import complete_case
-
-    enqueue_case(final_state)                       # after app.invoke()
-    ...
-    closed = complete_case(rec["state"], officer, decision, rationale, override)
-    close_case(customer_id, closed)                 # mark CLOSED + persist
-
-Each record on disk:
-    {
-      "customer_id": "...",
-      "status":      "PENDING" | "CLOSED",
-      "queued_at":   "...",
-      "summary":     { name, occupation, income, decision, risk_score, ... },
-      "state":       <the full KYCState dict — JSON serialisable>,
-      # added on close:
-      "final_decision": "...", "closed_at": "..."
-    }
+Pure storage — imports nothing from graph.py/agents.py, so it can never create
+an import cycle. Each record: {customer_id, status, queued_at, summary, state,
+(on close) final_decision, closed_at}.
 """
 
 import json
@@ -43,6 +23,7 @@ STATUS_CLOSED  = "CLOSED"
 
 
 def _now() -> str:
+    """Current timestamp string used for queued_at / closed_at."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST")
 
 
@@ -59,7 +40,7 @@ def _load() -> list:
 
 
 def _save(records: list) -> bool:
-    """Write the queue file (creates the folder if needed). Never raises."""
+    """Write the queue file (creating the folder if needed). Never raises."""
     try:
         folder = os.path.dirname(REVIEW_QUEUE_PATH)
         if folder:
@@ -74,7 +55,7 @@ def _save(records: list) -> bool:
 
 
 def _summary(state: dict) -> dict:
-    """Compact, list-view fields pulled out of a full KYCState."""
+    """Compact list-view fields pulled out of a full KYCState."""
     declared = state.get("declared", {}) or {}
     return {
         "name":             declared.get("name", ""),
@@ -90,13 +71,9 @@ def _summary(state: dict) -> dict:
 
 def enqueue_case(state: dict) -> Optional[str]:
     """
-    Add a pipeline result to the review inbox as PENDING.
-
-    Deduplicates by customer_id: re-running the same customer updates the
-    pending entry rather than stacking duplicates. A case that has already
-    been CLOSED is never silently reopened.
-
-    Returns the customer_id, or None if the case was already closed.
+    Add a pipeline result to the inbox as PENDING. Deduplicates by customer_id
+    (re-running updates the entry rather than stacking duplicates) and never
+    reopens a CLOSED case. Returns the customer_id, or None if already closed.
     """
     records = _load()
     cid = state.get("customer_id") or f"CASE-{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -140,7 +117,7 @@ def get_case(customer_id: str) -> Optional[dict]:
 
 def close_case(customer_id: str, closed_state: dict) -> bool:
     """
-    Mark a case CLOSED after complete_case() has run on its state. Stores the
+    Mark a case CLOSED after complete_case() has run on its state, storing the
     officer-decided final state back so the queue keeps a full audit record.
     """
     records = _load()

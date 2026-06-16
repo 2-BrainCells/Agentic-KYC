@@ -1,19 +1,11 @@
 """
-app.py — Streamlit Demo Interface
-===================================
-The face of the platform. Everything the judge sees.
+app.py — Streamlit demo interface.
 
-Four tabs:
-  1. KYC Pipeline   — submit a customer, run the pipeline, see the decision
-  2. Bulk Import    — stress-test with 20 customers simultaneously
-  3. Review Queue   — compliance-officer inbox: every human-routed case
-                      (single + bulk) collects here, persisted to disk
-  4. ROCm Telemetry — live AMD MI300X GPU + vLLM metrics
+Four tabs: KYC Pipeline (submit + run + decide one customer), Bulk Import
+(stress-test 20 customers), Review Queue (persistent officer inbox for every
+human-routed case), and ROCm Telemetry (live MI300X + vLLM metrics).
 
-Run with:
     streamlit run app.py
-
-Then open the URL shown in the terminal (usually http://localhost:8501)
 """
 
 import os
@@ -34,9 +26,7 @@ from review_queue import (
 )
 
 
-# ════════════════════════════════════════════════════════════════
-# PAGE SETUP
-# ════════════════════════════════════════════════════════════════
+# ── Page setup ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title = "Agentic KYC Platform — AMD MI300X",
@@ -45,40 +35,29 @@ st.set_page_config(
     initial_sidebar_state = "collapsed",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────
+# Custom CSS: decision badges, self-correction banner, AMD badge, audit lines.
 st.markdown("""
 <style>
-  /* Decision badges */
   .badge-approve { background:#10B981; color:white; padding:6px 18px;
     border-radius:20px; font-weight:700; font-size:1.1rem; }
   .badge-review  { background:#F59E0B; color:white; padding:6px 18px;
     border-radius:20px; font-weight:700; font-size:1.1rem; }
   .badge-reject  { background:#EF4444; color:white; padding:6px 18px;
     border-radius:20px; font-weight:700; font-size:1.1rem; }
-
-  /* Self-correction banner */
   .refine-banner { background:linear-gradient(90deg,#1e1b4b,#312e81);
     border-left:4px solid #E84040; border-radius:6px;
     padding:12px 16px; margin:12px 0; }
-
-  /* AMD hardware badge */
   .amd-badge { background:#1a1a2e; border-left:4px solid #E84040;
     border-radius:6px; padding:10px 16px; margin-bottom:8px; }
-
-  /* Intro / how-it-works card */
   .intro-card { background:#0f172a; border:1px solid #334155;
     border-radius:8px; padding:14px 18px; margin-bottom:16px; }
-
-  /* Audit log — monospace */
   .audit-line { font-family:monospace; font-size:0.82rem;
     color:#9CA3AF; margin:2px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════════════════════
-# CACHED RESOURCES (built once, reused across all reruns)
-# ════════════════════════════════════════════════════════════════
+# ── Cached resources (built once, reused across reruns) ─────────────────────
 
 @st.cache_resource
 def get_graph():
@@ -86,11 +65,10 @@ def get_graph():
     return build_graph()
 
 
-# ════════════════════════════════════════════════════════════════
-# SESSION STATE  (persists between Streamlit reruns)
-# ════════════════════════════════════════════════════════════════
+# ── Session state (persists between reruns) ─────────────────────────────────
 
 def init_state():
+    """Seed session_state keys used across tabs on first run."""
     defaults = {
         "case_result":      None,   # final state from app.invoke()
         "aadhaar_img_path": None,   # path to uploaded Aadhaar front image
@@ -105,12 +83,10 @@ def init_state():
 init_state()
 
 
-# ════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ════════════════════════════════════════════════════════════════
+# ── Helper functions ─────────────────────────────────────────────────────────
 
 def save_upload(uploaded_file) -> str:
-    """Save a Streamlit UploadedFile to disk and return the path."""
+    """Save a Streamlit UploadedFile to ./uploads and return its path."""
     os.makedirs("./uploads", exist_ok=True)
     path = f"./uploads/{uploaded_file.name}"
     with open(path, "wb") as f:
@@ -120,7 +96,7 @@ def save_upload(uploaded_file) -> str:
 
 def draw_aadhaar_overlay(image_path, bounding_boxes, low_confidence_fields,
                          field_confidence):
-    """Draws coloured field boxes on the Aadhaar image (green/amber by conf)."""
+    """Draw coloured field boxes on the Aadhaar image (green/amber by confidence)."""
     try:
         img  = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(img)
@@ -142,6 +118,7 @@ def draw_aadhaar_overlay(image_path, bounding_boxes, low_confidence_fields,
 
 
 def decision_badge(decision: str) -> str:
+    """Return an HTML decision badge for the given decision string."""
     cls = {
         Decision.APPROVE:            "badge-approve",
         Decision.REVIEW:             "badge-review",
@@ -152,7 +129,7 @@ def decision_badge(decision: str) -> str:
 
 
 def show_self_correction(audit_log: list) -> None:
-    """Shows the self-correction banner if the loop triggered."""
+    """Show the self-correction banner (and resolved note) if the loop ran."""
     loop_lines  = [l for l in audit_log if "SELF-CORRECTION" in l.upper()
                    or "REFINEMENT REQUEST" in l.upper()]
     clear_lines = [l for l in audit_log
@@ -169,6 +146,7 @@ def show_self_correction(audit_log: list) -> None:
 
 
 def show_contributing_factors(factors: list) -> None:
+    """Render the per-factor risk breakdown as a table."""
     if not factors:
         return
     rows = []
@@ -185,8 +163,8 @@ def show_contributing_factors(factors: list) -> None:
 
 def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
     """
-    Renders the full decision view for ONE case state — used by both the
-    Pipeline results panel and the Review Queue detail panel.
+    Render the full decision view for one case state — shared by the Pipeline
+    results panel and the Review Queue detail panel.
     """
     audit_log = result.get("audit_log", [])
     decision  = result.get("decision",  "REVIEW")
@@ -245,9 +223,7 @@ def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
                         unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════════════════════
-# HEADER + INTRO
-# ════════════════════════════════════════════════════════════════
+# ── Header + intro ───────────────────────────────────────────────────────────
 
 st.markdown("""
 <div class="amd-badge">
@@ -282,9 +258,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════════════════════
-# TABS
-# ════════════════════════════════════════════════════════════════
+# ── Tabs ─────────────────────────────────────────────────────────────────────
 
 q = counts()
 tab_kyc, tab_bulk, tab_queue, tab_telemetry = st.tabs([
@@ -295,15 +269,13 @@ tab_kyc, tab_bulk, tab_queue, tab_telemetry = st.tabs([
 ])
 
 
-# ════════════════════════════════════════════════════════════════
-# TAB 1 — KYC PIPELINE
-# ════════════════════════════════════════════════════════════════
+# ── Tab 1: KYC pipeline ──────────────────────────────────────────────────────
 
 with tab_kyc:
 
     col_form, col_results = st.columns([1, 1.4], gap="large")
 
-    # ── LEFT: Upload + Declared Data Form ─────────────────────
+    # Left: upload + declared-data form
     with col_form:
         st.subheader("Customer Submission")
         st.caption("Fields marked **\\***  are required.")
@@ -354,7 +326,7 @@ with tab_kyc:
 
         run_btn = st.button("🚀 Run KYC", type="primary", use_container_width=True)
 
-    # ── RIGHT: Results Panel ───────────────────────────────────
+    # Right: results panel
     with col_results:
         st.subheader("KYC Decision")
 
@@ -401,12 +373,11 @@ with tab_kyc:
             else:
                 st.session_state.queued_id = None
 
-        # ── Render results if available ────────────────────────
+        # Render results if available
         result = st.session_state.case_result
         if result:
-            # If this case was routed to a human and an officer has since
-            # decided it in the Review Queue, reflect that final decision here
-            # instead of the stale "awaiting review" banner.
+            # If this case was routed to a human and an officer has since decided
+            # it, reflect that final decision here instead of the stale banner.
             queued_id  = st.session_state.get("queued_id")
             closed_rec = None
             if queued_id:
@@ -414,7 +385,6 @@ with tab_kyc:
                 if rec and rec.get("status") == STATUS_CLOSED:
                     closed_rec = rec
                     result = dict(rec.get("state", result))
-                    # Surface the officer's final decision on the badge.
                     if result.get("final_decision"):
                         result["decision"] = result["final_decision"]
 
@@ -442,9 +412,7 @@ with tab_kyc:
                     "click **Run KYC** to begin.")
 
 
-# ════════════════════════════════════════════════════════════════
-# TAB 2 — BULK IMPORT STRESS TEST
-# ════════════════════════════════════════════════════════════════
+# ── Tab 2: bulk import stress test ──────────────────────────────────────────
 
 with tab_bulk:
     st.subheader("📦 Bulk Import Stress Test")
@@ -489,7 +457,7 @@ with tab_bulk:
                         aadhaar_path    = customer.get("aadhaar_path", ""),
                         received_at     = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
                     )
-                    # Father's name passthrough — lets the self-correction loop
+                    # Father's-name passthrough — lets the self-correction loop
                     # resolve bulk profiles that have no Aadhaar image.
                     if customer.get("father_name"):
                         initial["declared"]["father_name"] = customer["father_name"]
@@ -565,9 +533,7 @@ with tab_bulk:
             )
 
 
-# ════════════════════════════════════════════════════════════════
-# TAB 3 — REVIEW QUEUE  (compliance-officer inbox, persisted to disk)
-# ════════════════════════════════════════════════════════════════
+# ── Tab 3: review queue (persistent officer inbox) ──────────────────────────
 
 with tab_queue:
     st.subheader("🧑‍⚖️ Compliance Review Queue")
@@ -628,7 +594,7 @@ with tab_queue:
             close_case(cid, closed_state)
             st.rerun()
 
-    # ── Decided-cases history ─────────────────────────────────
+    # Decided-cases history
     if closed:
         with st.expander(f"✅ Decided cases ({len(closed)})", expanded=False):
             rows = []
@@ -652,9 +618,7 @@ with tab_queue:
                 st.rerun()
 
 
-# ════════════════════════════════════════════════════════════════
-# TAB 4 — ROCM TELEMETRY
-# ════════════════════════════════════════════════════════════════
+# ── Tab 4: ROCm telemetry ───────────────────────────────────────────────────
 
 with tab_telemetry:
     render_telemetry_tab()

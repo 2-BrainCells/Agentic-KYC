@@ -1,63 +1,18 @@
 """
-graph.py — LangGraph Pipeline
-==============================
-Wires all agents into a single compiled graph.
-This is the last backend file.
+graph.py — LangGraph pipeline wiring.
 
-Full pipeline:
+Flow: START → extract → id_verify → compliance → (refine ↺ extract) → fan_out →
+{entity_resolution ‖ financial_profiling} → risk → AUTO_APPROVE=END or
+ROUTE_TO_HUMAN → hitl_review → END.
 
-  START
-    │
-    ▼
-  extract ◄─────────────────────────────────┐
-    │                                        │ (self-correction loop)
-    ▼                                        │
-  id_verify                                  │
-    │                                        │
-    ▼                                        │
-  compliance ──── refinement_needed? ────► refine
-    │
-    │  CLEAR / resolved
-    ▼
-  fan_out ──────┬─────────────────────────┐
-                │                         │
-                ▼                         ▼
-        entity_resolution        financial_profiling
-                │                         │
-                └─────────┬───────────────┘
-                           ▼
-                          risk
-                           │
-               ┌───────────┴───────────┐
-               │                       │
-        AUTO_APPROVE             ROUTE_TO_HUMAN
-               │                       │
-              END               hitl_review
-                                       │
-                                      END
-                                (Streamlit calls
-                                complete_case() here)
+LangGraph auto-joins the two parallel branches at risk (both have edges to it),
+and audit_log's add-reducer lets them append safely. After hitl_review the graph
+ends; the UI calls complete_case() when the officer decides.
 
-Key design decisions:
-  - fan_out is a passthrough node that splits into two parallel branches
-  - LangGraph automatically JOINS entity_resolution + financial_profiling
-    before running risk (because both have edges to risk)
-  - audit_log uses Annotated[list, add] reducer so parallel branches
-    can both append without overwriting each other
-  - HITL: graph ends after hitl_review. Streamlit calls complete_case()
-    when the officer decides, which runs active_learning_cache_agent.
-
-Usage:
     from graph import build_graph, complete_case
-    from state import create_initial_state
-
-    app   = build_graph()
-    state = create_initial_state(...)
-    final = app.invoke(state)
-
-    # If routed to human review:
+    app = build_graph(); final = app.invoke(create_initial_state(...))
     if final["routing"] == "ROUTE_TO_HUMAN":
-        result = complete_case(final, "OFFICER-001", "APPROVE", "Clean after review")
+        complete_case(final, "OFFICER-001", "APPROVE", "Clean after review")
 """
 
 from __future__ import annotations
@@ -79,50 +34,29 @@ from agents import (
 )
 
 
-# ============================================================
-# ROUTER FUNCTIONS  (the Central Orchestrator's decisions)
-# ============================================================
+# ── Router functions (the central orchestrator's decisions) ─────────────────
 
 def route_after_compliance(state: KYCState) -> str:
-    """
-    Called after every compliance screening run.
-
-    If the compliance agent flagged an ambiguous match AND
-    wants more identity signal → route to refine (self-correction loop).
-
-    Otherwise (clear, confirmed hit, or retries exhausted) →
-    route to fan_out to start parallel profiling.
-    """
+    """Ambiguous match wanting more signal → 'refine'; otherwise → 'fan_out'."""
     if state.get("refinement_needed", False):
         return "refine"
     return "fan_out"
 
 
 def route_after_risk(state: KYCState) -> str:
-    """
-    Called after risk scoring.
-
-    AUTO_APPROVE  → end the graph immediately
-    anything else → send to human review queue
-    """
+    """AUTO_APPROVE → 'auto' (END); anything else → 'human' (review queue)."""
     routing = state.get("routing", Routing.ROUTE_TO_HUMAN)
     if routing == Routing.AUTO_APPROVE:
         return "auto"
     return "human"
 
 
-# ============================================================
-# FAN-OUT NODE  (passthrough that splits into two parallel branches)
-# ============================================================
+# ── Fan-out node (passthrough that splits into two parallel branches) ───────
 
 def fan_out_node(state: KYCState) -> dict:
     """
-    Passthrough — does no work itself.
-    Exists purely so LangGraph can split execution into two
-    parallel branches: entity_resolution AND financial_profiling.
-
-    Both branches run at the same time. LangGraph automatically
-    waits for BOTH to finish before running risk_scoring_agent.
+    Passthrough so LangGraph can run entity_resolution and financial_profiling
+    in parallel; it waits for both before running risk.
     """
     return {
         "case_status": CaseStatus.PROFILING,
@@ -130,23 +64,13 @@ def fan_out_node(state: KYCState) -> dict:
     }
 
 
-# ============================================================
-# BUILD GRAPH
-# ============================================================
+# ── Build graph ──────────────────────────────────────────────────────────────
 
 def build_graph():
-    """
-    Assembles and compiles the full KYC pipeline.
-
-    Call this ONCE at app startup:
-        app = build_graph()
-
-    Then invoke for each customer:
-        final_state = app.invoke(initial_state)
-    """
+    """Assemble and compile the full KYC pipeline. Call once at startup."""
     g = StateGraph(KYCState)
 
-    # ── Register all nodes ────────────────────────────────────
+    # Nodes
     g.add_node("extract",             data_extraction_agent)
     g.add_node("id_verify",           id_verification_agent)
     g.add_node("compliance",          compliance_screening_agent)
@@ -157,13 +81,12 @@ def build_graph():
     g.add_node("risk",                risk_scoring_agent)
     g.add_node("hitl_review",         hitl_review_agent)
 
-    # ── Sequential flow: START → extract → id_verify → compliance ─
+    # Sequential: START → extract → id_verify → compliance
     g.add_edge(START,        "extract")
     g.add_edge("extract",    "id_verify")
     g.add_edge("id_verify",  "compliance")
 
-    # ── Self-correction loop OR proceed to profiling ──────────────
-    #    route_after_compliance returns "refine" or "fan_out"
+    # Self-correction loop OR proceed to profiling
     g.add_conditional_edges(
         "compliance",
         route_after_compliance,
@@ -172,21 +95,15 @@ def build_graph():
             "fan_out":  "fan_out",   # clear/resolved → parallel profiling
         }
     )
+    g.add_edge("refine", "extract")   # loop back for the second pass
 
-    # Loop: refine bumps counter, sends back to extract for second pass
-    g.add_edge("refine", "extract")
-
-    # ── Parallel fan-out: fan_out → BOTH entity + financial ───────
-    #    LangGraph runs these two simultaneously
+    # Parallel fan-out then join at risk
     g.add_edge("fan_out", "entity_resolution")
     g.add_edge("fan_out", "financial_profiling")
-
-    # ── Parallel join: BOTH branches converge on risk ─────────────
-    #    LangGraph waits for both before running risk
     g.add_edge("entity_resolution",   "risk")
     g.add_edge("financial_profiling", "risk")
 
-    # ── Final routing: auto-approve or human review ───────────────
+    # Final routing: auto-approve (END) or human review
     g.add_conditional_edges(
         "risk",
         route_after_risk,
@@ -195,16 +112,12 @@ def build_graph():
             "human":       "hitl_review",  # medium/high → officer queue
         }
     )
-
-    # ── Human review → END (Streamlit calls complete_case() next) ─
-    g.add_edge("hitl_review", END)
+    g.add_edge("hitl_review", END)   # UI calls complete_case() next
 
     return g.compile()
 
 
-# ============================================================
-# HITL COMPLETION HELPER
-# ============================================================
+# ── HITL completion helper ──────────────────────────────────────────────────
 
 def complete_case(
     state:     dict,
@@ -214,33 +127,9 @@ def complete_case(
     override:   bool = False,
 ) -> dict:
     """
-    Call this from Streamlit when an officer makes their decision.
-
-    The graph ends after hitl_review. This function picks up from
-    there — it writes the human decision into state and runs
-    active_learning_cache_agent to close the case and store the
-    decision for future reference.
-
-    Args:
-        state:      The final state returned by app.invoke()
-        officer_id: e.g. "OFFICER-KYC-014"
-        decision:   Decision.APPROVE / REJECT / HOLD_FOR_DOCUMENTS
-        rationale:  Officer's written reasoning
-        override:   True if officer disagrees with system recommendation
-
-    Returns:
-        Updated state with final_decision, closed_at, cache_update
-
-    Usage in Streamlit:
-        if st.button("Approve"):
-            final = complete_case(
-                state      = case_state,
-                officer_id = "OFFICER-001",
-                decision   = "APPROVE",
-                rationale  = "Identity verified, corporate link is 3 hops.",
-                override   = True,
-            )
-            st.success(f"Case closed: {final['final_decision']}")
+    Finish a human-routed case. Writes the officer's decision into state and
+    runs active_learning_cache_agent to close the case and store the decision.
+    Returns the updated state (final_decision, closed_at, cache_update).
     """
     updated_state = {
         **state,
@@ -255,10 +144,7 @@ def complete_case(
     return active_learning_cache_agent(updated_state)
 
 
-# ============================================================
-# SANITY CHECK  — run this file directly to verify the full
-# pipeline executes end-to-end with mock data
-# ============================================================
+# ── Sanity check — run this file directly to exercise the full pipeline ─────
 
 if __name__ == "__main__":
     from state import create_initial_state
@@ -270,7 +156,7 @@ if __name__ == "__main__":
     app = build_graph()
     print("\n✅ Graph compiled successfully\n")
 
-    # ── Test 1: Clean customer (should AUTO-APPROVE) ──────────────
+    # Test 1: clean customer → AUTO-APPROVE
     print("Test 1: Clean customer (Priya Sharma)")
     print("-" * 40)
 
@@ -300,7 +186,7 @@ if __name__ == "__main__":
     for line in result_clean.get("audit_log", []):
         print(f"  {line}")
 
-    # ── Test 2: High-risk customer (should ROUTE_TO_HUMAN) ────────
+    # Test 2: high-risk customer → ROUTE_TO_HUMAN
     print("\n" + "=" * 60)
     print("Test 2: High-risk customer (Vikram Malhotra)")
     print("-" * 40)
@@ -320,9 +206,9 @@ if __name__ == "__main__":
         pan_path        = "/uploads/test/vikram_pan.jpg",
         received_at     = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
     )
-    # Father's name as it would appear in the Aadhaar QR 'care_of' field.
-    # The extraction agent only surfaces this on the refinement pass, so the
-    # self-correction loop has something to discover (CLAUDE.md §4).
+    # Father's name as it would appear in the Aadhaar QR 'care_of' field — the
+    # extraction agent only surfaces it on the refinement pass, so the loop has
+    # something to discover.
     state_risk["declared"]["father_name"] = "Ramesh Malhotra"
 
     result_risk = app.invoke(state_risk)
@@ -335,7 +221,7 @@ if __name__ == "__main__":
     for line in result_risk.get("audit_log", []):
         print(f"  {line}")
 
-    # ── Test 3: HITL completion simulation ────────────────────────
+    # Test 3: HITL completion simulation
     if result_risk.get("routing") == Routing.ROUTE_TO_HUMAN:
         print("\n" + "=" * 60)
         print("Test 3: Officer completes the HITL case")

@@ -1,25 +1,14 @@
 """
-agents.py — All KYC Agent Functions
-=====================================
-Every agent follows the same pattern:
-  INPUT  → receives the full KYCState
-  OUTPUT → returns ONLY the fields it changed (a partial dict)
-  LangGraph merges the return value back into shared state automatically.
+agents.py — All KYC agent functions.
 
-Agents in pipeline order:
-  1.  intake_agent               — initialise the case
-  2.  data_extraction_agent      — OCR + parse Aadhaar fields
-  3.  id_verification_agent      — cross-check extracted vs declared
-  4.  compliance_screening_agent — sanctions watchlist check
-  5.  refine_agent               — self-correction: bump counter + request
-  6.  entity_resolution_agent    — MCA21 / NetworkX corporate link analysis
-  7.  financial_profiling_agent  — income plausibility + anomaly flags
-  8.  risk_scoring_agent         — weighted score + NL explanation
-  9.  hitl_review_agent          — stub (human officer decides via UI)
-  10. active_learning_cache_agent — store officer decision for future cases
+Each agent receives the full KYCState and returns ONLY the fields it changed;
+LangGraph merges the partial dict back into shared state.
 
-Imports needed:
-  pip install networkx openai qdrant-client[fastembed] pytesseract pillow
+Pipeline order: intake → data_extraction → id_verification → compliance →
+(refine loop) → entity_resolution ‖ financial_profiling → risk_scoring →
+hitl_review → active_learning_cache.
+
+Requires: networkx, plus the tools.py dependencies (openai, qdrant, pytesseract).
 """
 
 import difflib
@@ -59,37 +48,32 @@ from tools import (
 )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _now() -> str:
+    """Current wall-clock time as HH:MM:SS, for audit-log timestamps."""
     return datetime.now().strftime("%H:%M:%S")
 
 
 def _name_similarity(name_a: str, name_b: str) -> float:
     """
-    Returns 0.0–1.0 similarity between two name strings.
-    Case-insensitive. Handles Indian name component ordering.
-    e.g. "Priya Sharma" vs "SHARMA PRIYA" → still high score.
+    0.0–1.0 similarity between two names, case-insensitive and order-agnostic.
+
+    Takes the best of: direct difflib ratio, token-overlap ratio, and a
+    containment bonus (0.90) when every token of the shorter 2+-token name
+    appears in the longer one — handles Indian names that drop a middle name
+    ("Ramesh Mehta" vs "Ramesh Prakash Mehta").
     """
     a = name_a.lower().strip()
     b = name_b.lower().strip()
 
-    # Direct similarity
     direct = difflib.SequenceMatcher(None, a, b).ratio()
 
-    # Component-wise similarity (handles inverted name order)
     parts_a = set(a.split())
     parts_b = set(b.split())
     if parts_a and parts_b:
         overlap   = len(parts_a & parts_b)
         component = overlap / max(len(parts_a), len(parts_b))
-        # Containment: Indian names routinely drop a middle name — a customer
-        # states "Ramesh Mehta" while the watchlist lists "Ramesh Prakash
-        # Mehta". If every token of the shorter name appears in the longer one,
-        # treat it as a strong match. Require the shorter name to have 2+ tokens
-        # so a lone shared surname (e.g. just "Mehta") can't trigger it.
         smaller     = min(len(parts_a), len(parts_b))
         containment = 0.90 if (smaller >= 2 and overlap == smaller) else 0.0
     else:
@@ -99,28 +83,27 @@ def _name_similarity(name_a: str, name_b: str) -> float:
 
 
 def _dob_year(dob: str) -> int:
-    """Pulls the birth year out of a DOB string like '1968-11-14'. 0 if unknown."""
+    """Extract the birth year from a DOB string like '1968-11-14'. 0 if unknown."""
     m = re.search(r"\b(19|20)\d{2}\b", dob or "")
     return int(m.group()) if m else 0
 
 
 def _parse_dob_range(dob_range: str) -> tuple:
-    """Parses a watchlist DOB range like '1966-1970' or '1966–1970' → (1966, 1970)."""
+    """Parse a watchlist DOB range '1966-1970' / '1966–1970' → (1966, 1970)."""
     years = re.findall(r"\b(?:19|20)\d{2}\b", dob_range or "")
     if not years:
         return (0, 0)
     return (int(years[0]), int(years[-1]))
 
 
-# DOB tolerance: watchlist DOB ranges are approximate, so allow ±3 years
-# before ruling someone out. Outside that window the match score is halved —
-# this is how an exact-name false positive (same name, different generation)
-# gets cleared without ever bothering a human.
+# DOB gate: watchlist ranges are approximate, so allow ±3y before ruling out.
+# Outside that window the match score is halved — clears same-name/different-
+# generation false positives without a human.
 DOB_GATE_TOLERANCE_YEARS = 3
 DOB_GATE_SCORE_FACTOR    = 0.5
 
-# Father's-name resolution: a differing father drops the match score by ~65%
-# (CLAUDE.md §4); a matching father escalates the score into the confirmed band.
+# Father's-name resolution: a differing father drops the score by ~65%; a
+# matching father escalates it into the confirmed band.
 FATHER_MATCH_THRESHOLD   = 0.80
 FATHER_MISMATCH_FACTOR   = 0.35
 FATHER_CONFIRM_SCORE     = 0.95
@@ -128,15 +111,14 @@ FATHER_CONFIRM_SCORE     = 0.95
 
 def _resolve_with_father(hit: dict, father: str) -> dict:
     """
-    The payoff of the self-correction loop. Compares the customer's father's
-    name (found via the Aadhaar QR 'care_of' field on the refinement pass)
-    against the father's name listed for the watchlist individual.
+    Self-correction payoff: compare the customer's father's name (found on the
+    refinement pass) against the watchlist individual's listed father.
 
-      father names DIFFER → match score drops ~65% → usually CLEAR
-      father names MATCH  → score escalates → CONFIRMED_HIT
+      differ → score ×0.35 → usually CLEAR
+      match  → score ≥0.95 → CONFIRMED_HIT
 
-    The loop works both ways — it can exonerate AND convict. Mutates and
-    returns the hit with an explanatory 'father_resolution' note.
+    Mutates and returns the hit with a 'father_resolution' note. The loop both
+    exonerates and convicts.
     """
     listed_father = hit.get("father_name")
     if not father or not listed_father:
@@ -161,7 +143,7 @@ def _resolve_with_father(hit: dict, father: str) -> dict:
 
 
 def _get_income_band(income: float) -> str:
-    """Maps INR income to band label."""
+    """Map an INR income figure to an INCOME_BANDS label."""
     for band, (low, high) in INCOME_BANDS.items():
         if low <= income < high:
             return band
@@ -170,9 +152,10 @@ def _get_income_band(income: float) -> str:
 
 def _estimate_bounding_boxes(image_path: str) -> dict:
     """
-    Returns approximate bounding box positions for standard Aadhaar card fields.
-    These positions are based on the typical UIDAI Aadhaar card layout.
-    Good enough for the UI overlay — pixel-perfect is not needed for the demo.
+    Approximate per-field bounding boxes for the UI overlay, scaled to the
+    image size and the typical UIDAI Aadhaar layout. Falls back to standard
+    card proportions if the image can't be opened. Not true detection — fine
+    for the demo overlay.
     """
     try:
         from PIL import Image as PILImage
@@ -192,19 +175,16 @@ def _estimate_bounding_boxes(image_path: str) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MOCK CORPORATE GRAPH  (Entity Resolution — NetworkX)
-# ═══════════════════════════════════════════════════════════════════════════
-# In production this would query MCA21 (Ministry of Corporate Affairs).
-# For the demo, this hardcoded graph covers both example customers.
-# Add more nodes here if your bulk dossiers include other high-risk profiles.
+# ── Mock corporate graph (entity resolution) ────────────────────────────────
+# In production this would query MCA21. The hardcoded graph covers the demo
+# customers; the one sanctioned entity is Orion Global Trade Solutions LLP.
 
 def _build_corporate_graph() -> nx.DiGraph:
+    """Construct the in-memory MCA21 mock graph used by entity resolution."""
     G = nx.DiGraph()
 
-    # Edges: (source, target, metadata)
     edges = [
-        # Vikram Malhotra's corporate chain (3 hops to sanctioned entity)
+        # Vikram Malhotra's chain (3 hops to the sanctioned entity)
         ("34 Golf Links New Delhi 110003",   "VMK Holdings Pvt Ltd",
          {"relationship": "registered_address_of"}),
         ("AAQPM6783R",                        "VMK Holdings Pvt Ltd",
@@ -230,9 +210,8 @@ def _build_corporate_graph() -> nx.DiGraph:
     for src, dst, data in edges:
         G.add_edge(src, dst, **data)
 
-    # Mark sanctioned nodes. Orion itself is the sanctioned entity (CLAUDE.md
-    # §8) — flagging it directly keeps the demo chain within the 3-hop search:
-    # customer address → VMK Holdings → Sunrise Export Import → Orion (3 hops).
+    # Flag Orion itself as sanctioned so the demo chain stays within 3 hops:
+    # customer address → VMK Holdings → Sunrise Export Import → Orion.
     for node in ("Orion Global Trade Solutions LLP", "SANCTIONED:ED_PMLA_2021_DEL_0892"):
         G.nodes[node]["sanctioned"] = True
         G.nodes[node]["label"] = (
@@ -244,17 +223,10 @@ def _build_corporate_graph() -> nx.DiGraph:
 CORPORATE_GRAPH = _build_corporate_graph()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 1 — INTAKE
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 1: intake ─────────────────────────────────────────────────────────
 
 def intake_agent(state: KYCState) -> KYCState:
-    """
-    Initialises the case. Confirms all required fields are present.
-    Writes the first audit log entry.
-    In practice this is handled by create_initial_state() in state.py —
-    this node just confirms receipt and updates case_status.
-    """
+    """Confirm receipt of the case and write the first audit-log entry."""
     cid     = state.get("customer_id", "UNKNOWN")
     income  = state.get("declared", {}).get("income", 0)
     name    = state.get("declared", {}).get("name", "UNKNOWN")
@@ -268,18 +240,17 @@ def intake_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 2 — DATA EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 2: data extraction ────────────────────────────────────────────────
 
 def data_extraction_agent(state: KYCState) -> KYCState:
     """
-    Reads the Aadhaar card image using OCR, then sends the raw text to
-    Llama-3 to extract structured identity fields as JSON.
+    OCR the Aadhaar image, then have Llama-3 structure the text into identity
+    fields. Runs twice when self-correcting: pass 0 standard (low temp), pass 1
+    refinement (high temp, targets the father's name).
 
-    Runs TWICE when the self-correction loop triggers:
-      Pass 0: standard extraction at low temperature
-      Pass 1: refinement pass at higher temperature, targeting father's name
+    The declared father's name is surfaced ONLY on the refinement pass — this
+    simulates the deep QR 'care_of' parse and gives the loop something to find.
+    Falls back to declared form data if the document can't be read.
     """
     refine_count = state.get("refine_count", 0)
     is_refinement = refine_count > 0
@@ -291,30 +262,22 @@ def data_extraction_agent(state: KYCState) -> KYCState:
     temperature = TEMP_REFINE_PASS if is_refinement else TEMP_FIRST_PASS
     pass_label  = f"Pass {refine_count} (refinement)" if is_refinement else "Pass 0 (standard)"
 
-    # Step 1: OCR — extract raw text from the Aadhaar front image, then append
-    # the BACK image text if one was uploaded. The back of an Aadhaar carries
-    # the full address and the QR 'care_of' (father/husband) field, so feeding
-    # both faces to the LLM gives the refinement pass a real chance of finding
-    # the father's name. No back image → back_text stays empty → unchanged.
+    # OCR the front, then append the back (carries address + QR 'care_of').
     ocr_text  = extract_text_from_image(aadhaar_path)
     back_text = extract_text_from_image(aadhaar_back) if aadhaar_back else ""
     used_back = bool(back_text.strip())
     if used_back:
         ocr_text = (ocr_text + "\n" + back_text).strip()
 
-    # Step 2: LLM — structure the OCR text into identity fields.
-    # If OCR produced nothing (no image on disk — bulk profiles, laptop mode),
-    # skip the LLM call entirely: there is nothing for it to read.
+    # Structure the OCR text; skip the LLM if there is nothing to read.
     if ocr_text.strip():
         extracted = parse_aadhaar_fields(ocr_text, directive, temperature)
     else:
         extracted = {}
     declared_fallback = False
 
-    # Step 2.5: declared-data fallback (mock mode). When the document could
-    # not be read, mirror the customer's declared KYC form so the rest of the
-    # pipeline still exercises real logic. The demo never crashes on a
-    # missing image — it degrades to declared data and says so in the audit.
+    # Declared-data fallback (mock mode): mirror the form so the rest of the
+    # pipeline still runs real logic when no readable document exists.
     if not extracted.get("full_name_english"):
         declared = state.get("declared", {})
         extracted = {
@@ -328,23 +291,17 @@ def data_extraction_agent(state: KYCState) -> KYCState:
         }
         declared_fallback = True
 
-    # Father's name only surfaces on the REFINEMENT pass — it simulates the
-    # deep parse of the Aadhaar QR 'care_of' field that the refinement
-    # directive requests. On pass 0 it stays hidden so the self-correction
-    # loop has something to find. (See CLAUDE.md §4 and §13.)
+    # Father's name only surfaces on the refinement pass (see docstring).
     if is_refinement and not extracted.get("father_name"):
         extracted["father_name"] = state.get("declared", {}).get("father_name")
 
     extracted["extraction_pass"] = refine_count
 
-    # Step 3: Confidence scores per field
     confidence = compute_field_confidence(extracted)
     low_conf   = [f for f, s in confidence.items() if s < 0.75 and extracted.get(f) is None]
 
-    # Step 4: Bounding boxes for UI overlay
     boxes = _estimate_bounding_boxes(aadhaar_path)
 
-    # Step 5: Determine extraction status
     required = ["full_name_english", "dob", "aadhaar_last4"]
     all_found = all(extracted.get(f) for f in required)
     status = ExtractionStatus.COMPLETE if all_found else ExtractionStatus.PARTIAL
@@ -372,46 +329,38 @@ def data_extraction_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 3 — ID VERIFICATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 3: ID verification ────────────────────────────────────────────────
 
 def id_verification_agent(state: KYCState) -> KYCState:
     """
-    Cross-checks extracted Aadhaar fields against what the customer declared.
-    Checks: name match, DOB match, address PIN match, UIDAI active status,
-    PAN-Aadhaar linkage (mandatory per RBI 2023).
-
-    Uses fuzzy name matching to handle:
-      - Name component ordering differences (Given Surname vs Surname Given)
-      - Minor spelling differences from OCR noise
+    Cross-check extracted Aadhaar fields against declared data: fuzzy name
+    match, exact DOB, PIN, UIDAI active status, and PAN-Aadhaar linkage (mocked
+    True). id_verified is True only when name, DOB, and UIDAI all pass with no
+    authenticity flags.
     """
     extracted = state.get("extracted", {})
     declared  = state.get("declared", {})
 
-    # ── Name match ────────────────────────────────────────────────────────
+    # Name
     ext_name  = extracted.get("full_name_english", "") or ""
     dec_name  = declared.get("name", "") or ""
     name_score = _name_similarity(ext_name, dec_name)
     name_match = name_score >= 0.80
 
-    # ── DOB match ─────────────────────────────────────────────────────────
+    # DOB
     ext_dob = (extracted.get("dob") or "").replace("/", "-").strip()
     dec_dob = (declared.get("dob") or "").replace("/", "-").strip()
     dob_match = ext_dob == dec_dob
 
-    # ── Address / PIN match ───────────────────────────────────────────────
+    # Address / PIN
     ext_pin = str(extracted.get("pin_code") or "").strip()
     dec_pin = str(declared.get("pin_code") or "").strip()
     pin_match = (ext_pin == dec_pin) if (ext_pin and dec_pin) else True
 
-    # ── UIDAI status (mocked — ACTIVE always in demo) ─────────────────────
+    # UIDAI status + PAN-Aadhaar linkage (both mocked in the demo)
     uidai_active = (extracted.get("uidai_status", "ACTIVE") == "ACTIVE")
-
-    # ── PAN-Aadhaar linkage (mocked as True — mandatory per RBI 2023) ─────
     pan_linked = True
 
-    # ── Authenticity flags ────────────────────────────────────────────────
     flags = []
     if name_score < 0.60:
         flags.append(f"Name mismatch: declared '{dec_name}' vs extracted '{ext_name}' (score {name_score})")
@@ -420,7 +369,6 @@ def id_verification_agent(state: KYCState) -> KYCState:
     if not uidai_active:
         flags.append("UIDAI status is not ACTIVE — Aadhaar may be suspended")
 
-    # ── Overall decision ──────────────────────────────────────────────────
     id_verified = name_match and dob_match and uidai_active and not flags
 
     reasons = []
@@ -454,32 +402,25 @@ def id_verification_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 4 — COMPLIANCE SCREENING
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 4: compliance screening ───────────────────────────────────────────
 
 def compliance_screening_agent(state: KYCState) -> KYCState:
     """
-    Screens the customer name against Indian and international watchlists:
-    FIU-IND, ED (PMLA), RBI Wilful Defaulters, UN Security Council.
+    Screen the customer name against the watchlists.
 
-    Step 1: Check the Human Exception Cache — if a prior officer decision
-            covers this profile, return it immediately.
-    Step 2: Query Qdrant sanctions DB (semantic search).
-            Falls back to LLM-as-judge if Qdrant is unavailable.
-    Step 3: Score the best match and determine screening_status.
-            CLEAR     → score < 0.60
-            AMBIGUOUS → score 0.60–0.85 (triggers self-correction loop)
-            HIT       → score > 0.85
-
-    The self-correction loop fires when: AMBIGUOUS + refine_count < cap.
+    1. Exception cache — a prior officer decision short-circuits to CLEAR.
+    2. Qdrant search (with fallbacks) over name variants.
+    3. Adjust each raw match: DOB gate, then father's-name resolution.
+    4. Status from the best adjusted score: < 0.60 CLEAR · 0.60–0.85 AMBIGUOUS
+       (arms the loop when no father's name and retries remain) · > 0.85 hit.
+       PEP entries are capped at POTENTIAL_MATCH (EDD, never auto-reject).
     """
     extracted = state.get("extracted", {})
     declared  = state.get("declared", {})
     name      = extracted.get("full_name_english") or declared.get("name", "")
     dob       = extracted.get("dob") or declared.get("dob", "")
 
-    # ── Step 1: Exception cache ───────────────────────────────────────────
+    # Step 1: exception cache
     cache_hit = check_exception_cache(name, dob)
     if cache_hit:
         return {
@@ -494,7 +435,7 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             ],
         }
 
-    # ── Step 2: Name variants for richer search ───────────────────────────
+    # Step 2: build name variants and search
     devanagari = extracted.get("full_name_devanagari", "")
     name_variants = list(filter(None, [
         name,
@@ -505,7 +446,7 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
 
     hits = query_sanctions_db(name, name_variants)
 
-    # ── Step 3: Adjust each raw name match with identity signals ─────────
+    # Step 3: adjust each raw match with identity signals
     father    = extracted.get("father_name")
     cust_year = _dob_year(dob)
     notes     = []
@@ -513,8 +454,7 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
     for hit in hits:
         raw_score = hit.get("match_score", 0.0)
 
-        # DOB gate: same name but a different generation is not the same
-        # person. Outside the listed range (±tolerance) → score halved.
+        # DOB gate: outside the listed range (±tolerance) → score halved.
         low, high = _parse_dob_range(hit.get("dob_range"))
         if cust_year and low and (
             cust_year < low  - DOB_GATE_TOLERANCE_YEARS or
@@ -528,22 +468,20 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             )
             notes.append(f"DOB gate cleared '{hit.get('matched_name')}': {hit['dob_gate']}")
 
-        # Father's-name resolution (self-correction payoff): only meaningful
-        # while the match is still in or above the ambiguous band.
+        # Father's-name resolution — only while the match is still ≥ CLEAR band.
         if father and hit.get("match_score", 0) >= FUZZY_CLEAR_BELOW:
             _resolve_with_father(hit, father)
             if hit.get("father_resolution"):
                 notes.append(f"'{hit.get('matched_name')}': {hit['father_resolution']}")
 
-    # ── Step 4: Determine screening status from best adjusted match ──────
+    # Step 4: screening status from the best adjusted match
     hits.sort(key=lambda h: h.get("match_score", 0), reverse=True)
     best_score = hits[0]["match_score"] if hits else 0.0
     best_hit   = hits[0] if hits else {}
     is_pep     = "PEP" in (best_hit.get("list_source") or "").upper()
 
     if best_score >= FUZZY_AMBIGUOUS_HIGH:
-        # PEP is not a sanction — a confirmed PEP goes to Enhanced Due
-        # Diligence with a human, never to an automatic reject.
+        # A confirmed PEP goes to EDD with a human, never an automatic reject.
         status = ScreeningStatus.POTENTIAL_MATCH if is_pep else ScreeningStatus.CONFIRMED_HIT
         refine = False
     elif best_score >= FUZZY_CLEAR_BELOW:
@@ -552,15 +490,14 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             refine = False
         else:
             status = ScreeningStatus.AMBIGUOUS
-            # Self-correction trigger: ambiguous AND no father's name to
-            # disambiguate AND retries left (CLAUDE.md §4).
+            # Loop trigger: ambiguous AND no father's name AND retries left.
             refine = (not father) and state.get("refine_count", 0) < REFINEMENT_MAX_TRIES
     else:
         status = ScreeningStatus.CLEAR
         refine = False
         hits   = []   # discard sub-threshold results
 
-    # ── Add agent reasoning to each surviving hit ─────────────────────────
+    # Attach agent reasoning to each surviving hit
     for hit in hits:
         if hit.get("father_resolution"):
             hit["reason"] = hit["father_resolution"]
@@ -591,18 +528,13 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 5 — REFINE  (self-correction loop bump)
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 5: refine (self-correction loop control) ──────────────────────────
 
 def refine_agent(state: KYCState) -> KYCState:
     """
-    Issued by the orchestrator when compliance returns AMBIGUOUS.
-    Increments the refine counter and writes the refinement request —
-    the extraction agent reads this on its next (retry) invocation.
-
-    This node does NO AI work — it's a control signal.
-    The intelligence comes from extraction_agent running again at
+    Control signal issued when compliance returns AMBIGUOUS. Bumps the refine
+    counter and writes the refinement request the extraction agent reads on its
+    retry. Does no AI work — the intelligence is the re-run of extraction at
     higher temperature with a focused directive.
     """
     count   = state.get("refine_count", 0) + 1
@@ -637,25 +569,19 @@ def refine_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 6 — ENTITY RESOLUTION
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 6: entity resolution (runs parallel to financial) ─────────────────
 
 def entity_resolution_agent(state: KYCState) -> KYCState:
     """
-    Traverses the corporate relationship graph to find indirect links
-    between the applicant's address / employer / PAN and any sanctioned entity.
+    Traverse the corporate graph for indirect links between the applicant
+    (address / PAN / occupation) and any sanctioned entity, within 3 hops.
 
-    Uses NetworkX to check paths up to 3 hops away.
-    In production: queries MCA21 (Ministry of Corporate Affairs) API.
-    In demo: uses the hardcoded CORPORATE_GRAPH defined above.
-
-    Runs in PARALLEL with financial_profiling_agent.
+    Entry points are matched exactly, then by fuzzy address containment, then
+    by a MALHOTRA + business directorship inference (mock MCA21 lookup).
     """
     extracted = state.get("extracted", {})
     declared  = state.get("declared", {})
 
-    # Build lookup keys for this customer
     lookup_nodes = list(filter(None, [
         declared.get("address", ""),
         extracted.get("pin_code", ""),
@@ -664,12 +590,11 @@ def entity_resolution_agent(state: KYCState) -> KYCState:
     ]))
 
     def _norm(s: str) -> str:
-        """Lowercase and strip punctuation so address strings compare fairly."""
+        """Lowercase and strip punctuation so addresses compare fairly."""
         return re.sub(r"[^a-z0-9 ]", " ", s.lower()).strip()
 
-    # Find the customer's entry points into the corporate graph.
-    # Exact node match first, then fuzzy address containment ("34 Golf Links,
-    # New Delhi" should still find node "34 Golf Links New Delhi 110003").
+    # Find the customer's entry points: exact node match, then fuzzy address
+    # containment ("34 Golf Links, New Delhi" → "34 Golf Links New Delhi 110003").
     customer_nodes = []
     for key in lookup_nodes:
         if CORPORATE_GRAPH.has_node(key):
@@ -684,16 +609,14 @@ def entity_resolution_agent(state: KYCState) -> KYCState:
                 customer_nodes.append(node)
                 break
 
-    # Mock MCA21 directorship inference (CLAUDE.md §8): the demo customer's
-    # surname + a business occupation maps to his holding company. In
-    # production this is a real registrar lookup by PAN/DIN.
+    # Mock MCA21 directorship inference: surname + business occupation → holding
+    # company. In production this is a registrar lookup by PAN/DIN.
     if not customer_nodes:
         cust_name = (extracted.get("full_name_english") or declared.get("name", "")).upper()
         occ = declared.get("occupation", "").lower()
         if "MALHOTRA" in cust_name and ("business" in occ or "consultant" in occ):
             customer_nodes.append("VMK Holdings Pvt Ltd")
 
-    # Search for paths to sanctioned nodes within 3 hops
     sanctioned_nodes = [
         n for n, d in CORPORATE_GRAPH.nodes(data=True)
         if d.get("sanctioned", False)
@@ -715,7 +638,6 @@ def entity_resolution_agent(state: KYCState) -> KYCState:
                         "hop_distance": len(path) - 1,
                         "target_label": CORPORATE_GRAPH.nodes[target].get("label", target),
                     }
-                    # Collect intermediate entities
                     linked_entities = [
                         {
                             "name":           node,
@@ -759,16 +681,14 @@ def entity_resolution_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 7 — FINANCIAL PROFILING
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 7: financial profiling (runs parallel to entity resolution) ───────
 
 def financial_profiling_agent(state: KYCState) -> KYCState:
     """
-    Assesses whether the declared income, occupation, and source of funds
-    are consistent and plausible under Indian income norms and PMLA guidelines.
-
-    Runs in PARALLEL with entity_resolution_agent.
+    Assess whether declared income, occupation, and source of funds are
+    plausible under Indian norms and PMLA. Optionally verifies declared income
+    against an uploaded salary slip. Builds anomaly flags, an activity band, a
+    risk contribution, and requires_edd (HNI income + anomalies → mandatory EDD).
     """
     declared = state.get("declared", {})
     income   = float(declared.get("income", 0))
@@ -780,14 +700,10 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
     income_band = _get_income_band(income)
     occ_band    = OCCUPATION_INCOME_MAP.get(occ, "entry")
 
-    # ── Plausibility checks ───────────────────────────────────────────────
     anomaly_flags = []
 
-    # ── Salary-slip income verification ──────────────────────────────────
-    # Only runs when a slip was actually uploaded AND a figure could be read.
-    # Corroboration → informational note. A large mismatch → anomaly flag.
-    # (No slip on the canonical customers / bulk profiles, so this is inert
-    # there and the 20/20 acceptance test is unaffected.)
+    # Salary-slip income verification — only when a slip was uploaded and a
+    # figure was read. Corroboration is a note; a large mismatch is a flag.
     income_verification = None
     if salary_slip_path and os.path.exists(salary_slip_path):
         slip = parse_salary_slip(salary_slip_path)
@@ -848,7 +764,7 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
             f"vague source of funds — high-risk pattern for FEMA compliance"
         )
 
-    # ── Activity band ─────────────────────────────────────────────────────
+    # Activity band
     if income_band in ("entry", "middle"):
         activity_band = ActivityBand.LOW
     elif income_band == "upper_middle":
@@ -856,8 +772,7 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
     else:
         activity_band = ActivityBand.HIGH
 
-    # ── Financial risk contribution ───────────────────────────────────────
-    # More anomaly flags = higher contribution
+    # Financial risk contribution: 0.15 per flag, +0.30 if HNI with any flag.
     fin_risk = min(0.15 * len(anomaly_flags), 1.0)
     if income_band == "hni" and anomaly_flags:
         fin_risk = min(fin_risk + 0.30, 1.0)
@@ -873,9 +788,8 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
         ),
     }
 
-    # HNI money with unexplained anomalies cannot be auto-approved —
-    # RBI KYC Master Direction mandates Enhanced Due Diligence by an officer.
-    # The risk agent honours this flag even when the weighted score is low.
+    # HNI money with unexplained anomalies → mandatory EDD; the risk agent
+    # honours this even when the weighted score is low.
     requires_edd = bool(anomaly_flags) and income_band == "hni"
 
     profile = {
@@ -900,23 +814,18 @@ def financial_profiling_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 8 — RISK SCORING & EXPLANATION
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 8: risk scoring & explanation ─────────────────────────────────────
 
 def risk_scoring_agent(state: KYCState) -> KYCState:
     """
-    Aggregates all agent outputs into a single risk score (0.0 – 1.0),
-    maps it to a decision band, and generates a plain-English explanation
-    using Llama-3. The explanation cites specific evidence — not generic text.
+    Aggregate all agent outputs into a weighted risk score (ID 30% + Compliance
+    40% + Network 20% + Financial 10%), map it to a band/decision, apply the
+    regulatory overrides, and have Llama-3 write an evidence-citing explanation.
 
-    Weights (from config.py):
-      ID Verification  30%
-      Compliance       40%
-      Network Risk     20%
-      Financial        10%
+    Overrides (outrank the weighted score): CONFIRMED_HIT → REJECT (PMLA); any
+    non-CLEAR screening → at least REVIEW (EDD); requires_edd → at least REVIEW
+    (RBI KYC MD).
     """
-    # ── Collect inputs ────────────────────────────────────────────────────
     id_ok        = state.get("id_verified", False)
     comp_hits    = state.get("compliance_hits", [])
     comp_status  = state.get("screening_status", ScreeningStatus.CLEAR)
@@ -925,15 +834,13 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
     extracted    = state.get("extracted", {})
     declared     = state.get("declared", {})
 
-    # ── Individual scores ─────────────────────────────────────────────────
     refines       = state.get("refine_count", 0)
     resolved_via_loop = comp_status == ScreeningStatus.CLEAR and refines > 0
 
+    # Per-factor raw scores. A loop-exonerated case keeps a 0.25 residual — it
+    # was ambiguous enough to investigate, so it never scores like a never-flagged case.
     id_score   = 0.0 if id_ok else 0.80
     comp_score = (
-        # A case the self-correction loop had to exonerate keeps a residual —
-        # it was ambiguous enough to investigate, so it never scores like a
-        # case that was never flagged at all.
         (0.25 if resolved_via_loop else 0.0)
              if comp_status == ScreeningStatus.CLEAR else
         0.60 if comp_status == ScreeningStatus.AMBIGUOUS else
@@ -943,7 +850,6 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
     net_score  = 0.80 if network.get("indirect_risk_flag") else 0.0
     fin_score  = financial.get("financial_risk_contribution", 0.0)
 
-    # ── Weighted aggregate ────────────────────────────────────────────────
     risk_score = round(
         id_score   * WEIGHT_ID_VERIFICATION +
         comp_score * WEIGHT_COMPLIANCE +
@@ -953,7 +859,7 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
     )
     risk_score = min(risk_score, 1.0)
 
-    # ── Risk band + decision ──────────────────────────────────────────────
+    # Band + decision from the score
     if risk_score < RISK_AUTO_APPROVE_BELOW:
         risk_band = RiskBand.LOW
         decision  = Decision.APPROVE
@@ -967,29 +873,25 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
         decision  = Decision.REVIEW
         routing   = Routing.ROUTE_TO_HUMAN
 
-    # ── Regulatory overrides (these outrank the weighted score) ──────────
+    # Regulatory overrides (outrank the weighted score)
     override_note = ""
     if comp_status == ScreeningStatus.CONFIRMED_HIT:
-        # A confirmed watchlist hit is a REJECT regardless of arithmetic —
-        # PMLA does not allow onboarding a sanctioned individual.
         decision  = Decision.REJECT
         risk_band = RiskBand.HIGH
         routing   = Routing.ROUTE_TO_HUMAN
         override_note = "OVERRIDE: confirmed watchlist hit → REJECT (PMLA)"
     elif decision == Decision.APPROVE and comp_status != ScreeningStatus.CLEAR:
-        # Any unresolved screening signal (PEP, potential match) needs a human.
         decision  = Decision.REVIEW
         routing   = Routing.ROUTE_TO_HUMAN
         risk_band = RiskBand.MEDIUM if risk_band == RiskBand.LOW else risk_band
         override_note = f"OVERRIDE: screening status {comp_status} → human review (EDD)"
     elif decision == Decision.APPROVE and financial.get("requires_edd"):
-        # HNI income with anomaly flags → mandatory Enhanced Due Diligence.
         decision  = Decision.REVIEW
         routing   = Routing.ROUTE_TO_HUMAN
         risk_band = RiskBand.MEDIUM if risk_band == RiskBand.LOW else risk_band
         override_note = "OVERRIDE: HNI income with anomalies → mandatory EDD (RBI KYC MD)"
 
-    # ── Contributing factors breakdown ───────────────────────────────────
+    # Traceable contributing-factors breakdown
     factors = [
         {
             "factor":             "ID Verification",
@@ -1034,7 +936,7 @@ def risk_scoring_agent(state: KYCState) -> KYCState:
         },
     ]
 
-    # ── LLM explanation paragraph ─────────────────────────────────────────
+    # LLM explanation paragraph
     anomaly_summary = (
         "\n".join(f"- {f}" for f in financial.get("anomaly_flags", []))
         or "None"
@@ -1083,18 +985,13 @@ Write the explanation now:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 9 — HUMAN-IN-THE-LOOP REVIEW  (stub — UI overrides this)
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 9: human-in-the-loop review (stub — UI drives the real decision) ──
 
 def hitl_review_agent(state: KYCState) -> KYCState:
     """
-    Placeholder node for human review. In the real Streamlit app, the
-    officer clicks Approve / Reject / Hold in the UI — that updates
-    human_decision in the state directly.
-
-    This stub exists so the graph can route to it and the pipeline
-    completes cleanly even without UI interaction (useful for testing).
+    Placeholder node so the graph can route to human review and still complete
+    cleanly in tests. In the app, the officer decides in the UI and
+    complete_case() runs the cache agent.
     """
     return {
         "case_status": CaseStatus.IN_REVIEW,
@@ -1105,17 +1002,14 @@ def hitl_review_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AGENT 10 — ACTIVE LEARNING CACHE UPDATE
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Agent 10: active learning cache update ──────────────────────────────────
 
 def active_learning_cache_agent(state: KYCState) -> KYCState:
     """
-    After a human officer makes a decision, store that decision as an
-    embedding in the 'exception_cache' Qdrant collection.
-
-    Future cases with similar profiles will surface this decision first,
-    allowing the system to learn from human judgment without retraining.
+    Store the officer's decision as an embedding in the 'exception_cache' Qdrant
+    collection so future similar profiles surface it, and close the case. The
+    cache write is best-effort — a failure is non-critical and the case still
+    closes with the human decision.
     """
     human = state.get("human_decision", {}) or {}
     officer_decision = human.get("decision", Decision.REVIEW)
@@ -1127,7 +1021,6 @@ def active_learning_cache_agent(state: KYCState) -> KYCState:
     name      = extracted.get("full_name_english") or declared.get("name", "")
     dob       = extracted.get("dob") or declared.get("dob", "")
 
-    # Store in Qdrant exception_cache collection (best-effort)
     cache_entry = {
         "name":       name,
         "dob":        dob,
@@ -1140,8 +1033,7 @@ def active_learning_cache_agent(state: KYCState) -> KYCState:
     }
 
     try:
-        # Reuse the shared embedded client from tools.py — local-mode Qdrant
-        # locks its storage folder, so a second QdrantClient would fail.
+        # Reuse the shared embedded client — local-mode Qdrant locks its folder.
         from tools import qdrant_client as client
         client.add(
             collection_name = "exception_cache",
@@ -1168,9 +1060,7 @@ def active_learning_cache_agent(state: KYCState) -> KYCState:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SANITY CHECK  —  run this file directly to verify all agents import cleanly
-# ═══════════════════════════════════════════════════════════════════════════
+# ── Sanity check — run this file directly to verify all agents import ───────
 
 if __name__ == "__main__":
     from state import create_initial_state
@@ -1196,7 +1086,6 @@ if __name__ == "__main__":
     for name, fn in agents:
         print(f"   - {name}")
 
-    # Quick dry-run of agents that don't need external services
     print("\nRunning dry-run checks (no GPU required)...")
 
     test_state = create_initial_state(
@@ -1211,21 +1100,17 @@ if __name__ == "__main__":
         received_at=datetime.now().isoformat(),
     )
 
-    # Test intake
     r = intake_agent(test_state)
     print(f"   intake_agent              → case_status: {r.get('case_status')}")
 
-    # Test financial (no external deps)
     test_state["extracted"] = {"full_name_english": "PRIYA SHARMA", "dob": "1992-09-08"}
     r = financial_profiling_agent(test_state)
     print(f"   financial_profiling_agent → activity_band: {r['financial_profile']['expected_activity_band']}, "
           f"anomalies: {len(r['financial_profile']['anomaly_flags'])}")
 
-    # Test entity resolution (uses local NetworkX — no external deps)
     r = entity_resolution_agent(test_state)
     print(f"   entity_resolution_agent   → indirect_flag: {r['network_risk']['indirect_risk_flag']}")
 
-    # Test id_verification (no external deps)
     test_state["extracted"] = {
         "full_name_english": "PRIYA SHARMA", "dob": "1992-09-08",
         "uidai_status": "ACTIVE", "pin_code": "560034",

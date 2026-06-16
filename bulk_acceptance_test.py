@@ -1,17 +1,12 @@
 """
-bulk_acceptance_test.py — Bulk Demo Regression Test
-====================================================
-Runs all 20 bulk customers through the compiled pipeline and checks each
-final decision against the `expected_decision` recorded in
-mock_data/bulk_customers.json.
+bulk_acceptance_test.py — Bulk demo regression test.
 
-What to do with this: run it after ANY change to agents/tools/config —
-if it prints 20/20 PASS, the bulk-import demo climax is safe.
+Runs all 20 bulk customers through the compiled pipeline and checks each final
+decision against the `expected_decision` in mock_data/bulk_customers.json. Run
+it after ANY change to agents/tools/config — 20/20 PASS (12/5/3) means the
+bulk-import demo climax is safe. Works offline (mock fallbacks) and on the MI300X.
 
     python bulk_acceptance_test.py
-
-Works fully offline (no vLLM, no Qdrant) thanks to the mock fallbacks,
-and identically on the MI300X with the real services up.
 """
 
 import json
@@ -24,6 +19,7 @@ from datetime import datetime
 
 
 def main() -> int:
+    """Run every bulk profile and compare its decision to the expected value."""
     app = build_graph()
 
     with open(BULK_DOSSIERS_PATH, encoding="utf-8") as f:
