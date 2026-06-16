@@ -43,7 +43,7 @@ def get_vram():
     """
     try:
         result = subprocess.run(
-            ["rocm-smi", "--showmemuse", "--json"],
+            ["rocm-smi", "--showmeminfo", "vram", "--json"],
             capture_output=True, text=True, timeout=3
         )
         data  = json.loads(result.stdout)
@@ -83,15 +83,19 @@ def get_vllm_stats():
     try:
         text = requests.get(VLLM_METRICS_URL, timeout=3).text
 
-        # Parse Prometheus text format: "metric_name value"
+        # Parse Prometheus text format: "metric_name{label="x",...} value"
+        # The metric name carries a label set in {...}; we strip it so the
+        # bare name (e.g. "vllm:prompt_tokens_total") is the dict key, and we
+        # SUM across label series in case a metric is split into several lines.
         raw = {}
         for line in text.splitlines():
             if line.startswith("#") or not line.strip():
                 continue
             parts = line.split()
             if len(parts) >= 2:
+                name = parts[0].split("{")[0]   # drop the {label="..."} suffix
                 try:
-                    raw[parts[0]] = float(parts[1])
+                    raw[name] = raw.get(name, 0.0) + float(parts[1])
                 except ValueError:
                     pass
 
@@ -119,7 +123,17 @@ def get_vllm_stats():
         # ── Other metrics ─────────────────────────────────────────────────
         active_req  = int(raw.get("vllm:num_requests_running", 0))
         queued_req  = int(raw.get("vllm:num_requests_waiting", 0))
-        kv_cache    = round(raw.get("vllm:gpu_cache_usage_perc", 0) * 100, 1)
+        # V1 engine renamed this gauge; accept either spelling. Value is a
+        # 0..1 fraction, so ×100 for a percentage.
+        kv_cache    = round(raw.get(
+            "vllm:kv_cache_usage_perc",
+            raw.get("vllm:gpu_cache_usage_perc", 0)
+        ) * 100, 1)
+
+        # Keep only the vllm: series for the live "raw metrics" expander —
+        # lets you eyeball the parsed dict during the demo, so a renamed or
+        # missing metric is obvious instead of silently showing 0.
+        raw_vllm = {k: v for k, v in sorted(raw.items()) if k.startswith("vllm:")}
 
         return {
             "tps":            tps,
@@ -129,6 +143,7 @@ def get_vllm_stats():
             "active_requests": active_req,
             "queued_requests": queued_req,
             "kv_cache_pct":   kv_cache,
+            "raw":            raw_vllm,
             "ok":             True
         }
 
@@ -136,7 +151,7 @@ def get_vllm_stats():
         return {
             "tps": 0.0, "total_tokens": 0, "prompt_tokens": 0,
             "gen_tokens": 0, "active_requests": 0, "queued_requests": 0,
-            "kv_cache_pct": 0.0, "ok": False, "err": str(e)
+            "kv_cache_pct": 0.0, "raw": {}, "ok": False, "err": str(e)
         }
 
 
@@ -262,6 +277,24 @@ def render_telemetry_tab():
         """,
         unsafe_allow_html=True
     )
+
+    # ── Raw parsed metrics (debug / demo X-ray) ───────────────────────────
+    # Shows exactly what the parser pulled from /metrics and rocm-smi. If a
+    # headline number reads 0, open this to see whether the metric is missing,
+    # renamed, or genuinely zero.
+    with st.expander("🔬 Raw parsed metrics (live)"):
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.caption("vLLM /metrics (parsed `vllm:` series)")
+            raw_vllm = inf.get("raw", {})
+            if raw_vllm:
+                st.json(raw_vllm)
+            else:
+                st.warning("No `vllm:` metrics parsed — endpoint unreachable "
+                           "or returned no vllm series.")
+        with rc2:
+            st.caption("rocm-smi VRAM (parsed)")
+            st.json({k: v for k, v in vram.items() if k != "raw"})
 
     # ── Status / error messages ───────────────────────────────────────────
     if not vram["ok"]:
