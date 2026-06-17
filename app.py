@@ -460,9 +460,10 @@ with tab_kyc:
         pin_code    = c3.text_input("PIN Code *")
         nationality = c4.text_input("Nationality", value="Indian")
         father_name = st.text_input(
-            "Father's / Husband's Name (optional)",
-            help="Used by the self-correction loop to disambiguate watchlist "
-                 "matches when the Aadhaar QR cannot be parsed.",
+            "Father's / Husband's Name *",
+            help="Required. Used to resolve watchlist matches — the screening "
+                 "agent compares it against the listed individual's father to "
+                 "confirm or clear a hit (and to flag PEPs).",
         )
         occupation  = st.selectbox("Occupation", [
             "Software Engineer", "Senior Software Engineer",
@@ -492,6 +493,7 @@ with tab_kyc:
                 label for label, val in [
                     ("Full Name", name), ("Date of Birth", dob),
                     ("Residential Address", address), ("PIN Code", pin_code),
+                    ("Father's / Husband's Name", father_name),
                 ] if not str(val).strip()
             ]
             if missing:

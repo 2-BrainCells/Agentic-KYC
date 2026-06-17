@@ -138,9 +138,22 @@ def get_snapshot():
 # ── Streamlit rendering ──────────────────────────────────────────────────────
 
 def render_telemetry_tab():
-    """Render the full ROCm telemetry tab and self-refresh every 2 seconds."""
+    """
+    Render the ROCm telemetry tab. The live numbers self-refresh every 2 seconds
+    via an st.fragment — only this panel reruns, NOT the whole app, so the rest
+    of the UI (forms, Review Queue) stays interactive.
+    """
     import streamlit as st
 
+    @st.fragment(run_every=2)
+    def _telemetry_body():
+        _render_telemetry_body(st)
+
+    _telemetry_body()
+
+
+def _render_telemetry_body(st):
+    """The actual telemetry rendering — called inside the auto-refreshing fragment."""
     snap = get_snapshot()
     vram = snap["vram"]
     inf  = snap["inference"]
@@ -229,6 +242,6 @@ def render_telemetry_tab():
         st.error(f"vLLM metrics unavailable — check server at "
                  f"{VLLM_METRICS_URL} — error: {inf.get('err')}")
 
-    # Auto-refresh this tab every 2 seconds.
-    time.sleep(2)
-    st.rerun()
+    # The enclosing st.fragment(run_every=2) auto-refreshes this panel every
+    # 2 seconds — no manual sleep/rerun, so the rest of the app stays responsive.
+    st.caption(f"Auto-refreshing every 2s · last update {snap['timestamp']}")
