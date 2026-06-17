@@ -641,6 +641,24 @@ with tab_kyc:
                 )
                 for f in (result.get("verification_details") or {}).get("authenticity_flags", []):
                     st.caption(f"• {f}")
+            elif (result.get("decision") == Decision.REJECT
+                  and result.get("routing") == Routing.ROUTE_TO_HUMAN):
+                # Confirmed watchlist hit: the system has DECIDED reject, but under
+                # PMLA a compliance officer must confirm it before it is finalised.
+                hits    = result.get("compliance_hits") or []
+                matched = hits[0].get("matched_name", "") if hits else ""
+                src     = hits[0].get("list_source", "") if hits else ""
+                st.error(
+                    "⛔ **REJECTED — confirmed watchlist match.** "
+                    + (f"Identity confirmed against **{matched}**"
+                       + (f" ({src})" if src else "") + ". " if matched else "")
+                    + "Under the PMLA this rejection must be signed off by a "
+                    "compliance officer before it is finalised, so the case has been "
+                    f"placed in the **Review Queue** tab as `{st.session_state.queued_id}` "
+                    "for mandatory confirmation."
+                )
+                st.caption("The system decision is REJECT — the officer step is a "
+                           "regulatory sign-off, not a re-assessment.")
             elif result.get("routing") == Routing.ROUTE_TO_HUMAN:
                 st.warning(
                     "⚠ **Human review required** — this case was added to the "

@@ -350,8 +350,14 @@ def data_extraction_agent(state: KYCState) -> KYCState:
         declared_fallback = True
 
     # Father's name only surfaces on the refinement pass (see docstring).
-    if is_refinement and not extracted.get("father_name"):
-        extracted["father_name"] = state.get("declared", {}).get("father_name")
+    # The declared form value represents the deep QR 'care_of' parse and is
+    # AUTHORITATIVE on refinement: it overrides any partial/garbled OCR read
+    # (e.g. Tesseract catching only the Devanagari surname "मेहता"), which would
+    # otherwise score 0.00 against a Latin listed father and wrongly CLEAR a hit.
+    if is_refinement:
+        declared_father = state.get("declared", {}).get("father_name")
+        if declared_father:
+            extracted["father_name"] = declared_father
 
     extracted["extraction_pass"] = refine_count
 
