@@ -145,7 +145,7 @@ def render_telemetry_tab():
     vram = snap["vram"]
     inf  = snap["inference"]
 
-    st.markdown("## ⚡ AMD Instinct MI300X — Live Telemetry")
+    st.markdown("## AMD Instinct MI300X — Live Telemetry")
     st.caption(f"Last refreshed: {snap['timestamp']}  •  "
                f"Source: rocm-smi + vLLM /metrics")
     st.divider()
@@ -153,14 +153,14 @@ def render_telemetry_tab():
     # Row 1: headline numbers
     st.markdown("### Inference Performance")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric(label="🚀 Tokens / Second", value=f"{inf['tps']}",
+    c1.metric(label="Tokens / Second", value=f"{inf['tps']}",
               help="Generated tokens per second across all active requests")
-    c2.metric(label="🔢 Total Tokens Generated", value=f"{inf['total_tokens']:,}",
+    c2.metric(label="Total Tokens Generated", value=f"{inf['total_tokens']:,}",
               help="Cumulative tokens generated since vLLM server started")
-    c3.metric(label="🔄 Active Requests", value=inf["active_requests"],
+    c3.metric(label="Active Requests", value=inf["active_requests"],
               help="KYC agent requests currently being processed by the GPU")
-    c4.metric(label="⏳ Queue Depth", value=inf["queued_requests"],
-              help="Requests waiting — rises during bulk import stress test")
+    c4.metric(label="Queue Depth", value=inf["queued_requests"],
+              help="Requests waiting — rises under concurrent load")
     st.divider()
 
     # Row 2: VRAM bar
@@ -172,18 +172,18 @@ def render_telemetry_tab():
     col_num.metric("VRAM %", f"{vram['pct']}%")
 
     if vram["pct"] > 85:
-        st.warning("⚠️ VRAM usage high — consider reducing batch size")
+        st.warning("VRAM usage high — consider reducing batch size")
     elif vram["pct"] > 50:
-        st.info("ℹ️ VRAM at moderate utilisation")
+        st.info("VRAM at moderate utilisation")
     else:
-        st.success("✅ VRAM healthy")
+        st.success("VRAM healthy")
     st.divider()
 
     # Row 3: inference detail
     st.markdown("### Inference Detail")
     d1, d2, d3 = st.columns(3)
     d1.metric(label="KV Cache Used", value=f"{inf['kv_cache_pct']}%",
-              help="vLLM PagedAttention KV cache fill — climbs under bulk load")
+              help="vLLM PagedAttention KV cache fill — climbs under load")
     d2.metric(label="Prompt Tokens", value=f"{inf['prompt_tokens']:,}",
               help="Tokens from input documents and instructions")
     d3.metric(label="Generated Tokens", value=f"{inf['gen_tokens']:,}",
@@ -208,7 +208,7 @@ def render_telemetry_tab():
     )
 
     # Raw parsed metrics — X-ray for "why is this 0?" (missing / renamed / zero).
-    with st.expander("🔬 Raw parsed metrics (live)"):
+    with st.expander("Raw parsed metrics (live)"):
         rc1, rc2 = st.columns(2)
         with rc1:
             st.caption("vLLM /metrics (parsed `vllm:` series)")

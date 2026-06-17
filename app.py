@@ -1,15 +1,16 @@
 """
-app.py — Streamlit demo interface.
+app.py — Streamlit operator interface.
 
-Four tabs: KYC Pipeline (submit + run + decide one customer), Bulk Import
-(stress-test 20 customers), Review Queue (persistent officer inbox for every
-human-routed case), and ROCm Telemetry (live MI300X + vLLM metrics).
+Three tabs: KYC Pipeline (submit + run + decide one customer), Review Queue
+(persistent officer inbox for every human-routed case), and ROCm Telemetry
+(live MI300X + vLLM metrics).
+
+The bulk import stress test is CLI-only — run `python bulk_acceptance_test.py`.
 
     streamlit run app.py
 """
 
 import os
-import json
 import time
 from datetime import datetime, date
 
@@ -20,7 +21,7 @@ from PIL import Image, ImageDraw
 from graph        import build_graph, complete_case
 from state        import create_initial_state, Decision, Routing, CaseStatus
 from telemetry    import render_telemetry_tab
-from config       import BULK_DOSSIERS_PATH, DOCUMENT_SUBMISSION_EMAIL, REAPPLY_COOLDOWN_MINUTES
+from config       import DOCUMENT_SUBMISSION_EMAIL, REAPPLY_COOLDOWN_MINUTES
 from review_queue import (
     enqueue_case, list_cases, get_case, close_case, clear_queue, counts,
     STATUS_PENDING, STATUS_CLOSED,
@@ -34,7 +35,7 @@ from applicant_registry import (
 
 st.set_page_config(
     page_title = "Agentic KYC Platform — AMD MI300X",
-    page_icon  = "🔐",
+    page_icon  = ":material/security:",
     layout     = "wide",
     initial_sidebar_state = "collapsed",
 )
@@ -77,8 +78,7 @@ def init_state():
         "case_result":      None,   # final state from app.invoke()
         "aadhaar_img_path": None,   # path to uploaded Aadhaar front image
         "queued_id":        None,   # customer_id if this case went to the queue
-        "bulk_results":     [],     # list of bulk import results
-        "bulk_queued":      0,      # how many bulk cases were sent to the queue
+        "selected_case":    None,   # customer_id selected in the Review Queue list
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -141,18 +141,18 @@ def show_self_correction(audit_log: list) -> None:
     if loop_lines:
         st.markdown(f"""
         <div class="refine-banner">
-          <strong>🔄 Self-Correction Loop Triggered</strong><br>
+          <strong>Self-Correction Loop Triggered</strong><br>
           <span style="color:#A5B4FC;font-size:0.88rem">{loop_lines[0]}</span>
         </div>
         """, unsafe_allow_html=True)
     if clear_lines:
-        st.success("✅ Autonomously resolved — compliance ambiguity cleared by agent")
+        st.success("Autonomously resolved — compliance ambiguity cleared by agent")
 
 
 def hold_instruction(app_no: str) -> str:
     """Next-step message for an applicant whose case was held for documents."""
     return (
-        f"📨 **Next step — submit your documents.** Please email your supporting "
+        f"**Next step — submit your documents.** Please email your supporting "
         f"documents (e.g. ITR, GST certificate, bank statements) to "
         f"**{DOCUMENT_SUBMISSION_EMAIL}**, quoting your application number "
         f"**`{app_no or 'N/A'}`** in the subject line. Our compliance team will "
@@ -250,12 +250,15 @@ def build_analysis_report(state: dict, app_no: str) -> str:
 # Purely cosmetic — makes the "decisions forming" effect watchable in the demo.
 STREAM_STEP_DELAY = 0.6
 
-CHECK_ICON = {"pass": "✅", "fail": "❌", "warn": "⚠️", "info": "•"}
+# Status glyphs are plain text symbols (not emoji), coloured via CSS spans.
+CHECK_ICON  = {"pass": "✓", "fail": "✕", "warn": "!", "info": "•"}
+CHECK_COLOR = {"pass": "#10B981", "fail": "#EF4444", "warn": "#F59E0B",
+               "info": "#9CA3AF"}
 
 
 def render_checklists(checklists: list) -> None:
     """
-    Render each agent's step-wise checklist as a bordered card with ✓/✗/⚠ lines.
+    Render each agent's step-wise checklist as a bordered card with status lines.
     Shared by the live stream during a run and the static results/queue views.
     """
     if not checklists:
@@ -263,15 +266,19 @@ def render_checklists(checklists: list) -> None:
     for cl in checklists:
         with st.container(border=True):
             st.markdown(
-                f"**{cl.get('icon','')} {cl.get('agent','')}** "
+                f"**{cl.get('agent','')}** "
                 f"<span style='color:#9CA3AF'>— {cl.get('summary','')}</span>",
                 unsafe_allow_html=True,
             )
             for s in cl.get("steps", []):
-                icon   = CHECK_ICON.get(s.get("status", "info"), "•")
+                status = s.get("status", "info")
+                icon   = CHECK_ICON.get(status, "•")
+                color  = CHECK_COLOR.get(status, "#9CA3AF")
                 detail = s.get("detail", "")
                 st.markdown(
-                    f"<div class='audit-line'>{icon} {s.get('label','')}"
+                    f"<div class='audit-line'>"
+                    f"<span style='color:{color};font-weight:700'>{icon}</span> "
+                    f"{s.get('label','')}"
                     + (f" — <span style='color:#CBD5E1'>{detail}</span>" if detail else "")
                     + "</div>",
                     unsafe_allow_html=True,
@@ -328,13 +335,13 @@ def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
     iv = (result.get("financial_profile") or {}).get("income_verification")
     if iv:
         if iv.get("status") == "VERIFIED":
-            st.success(f"💸 Income proof: {iv.get('note')}")
+            st.success(f"Income proof: {iv.get('note')}")
         else:
-            st.warning(f"💸 Income proof: {iv.get('note')}")
+            st.warning(f"Income proof: {iv.get('note')}")
 
     checklists = result.get("agent_checklists", [])
     if checklists:
-        with st.expander("🧠 Agent Decision Checklists (step-by-step)", expanded=True):
+        with st.expander("Agent Decision Checklists (step-by-step)", expanded=True):
             render_checklists(checklists)
 
     st.markdown("**Contributing Factors**")
@@ -352,10 +359,10 @@ def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
             )
             if overlaid:
                 st.image(overlaid,
-                         caption="🟢 High confidence  🟡 Medium / Low confidence",
+                         caption="Green: high confidence  ·  Amber: medium / low confidence",
                          width=380)
 
-    with st.expander("📋 Full Audit Trail", expanded=False):
+    with st.expander("Full Audit Trail", expanded=False):
         for line in audit_log:
             st.markdown(f'<p class="audit-line">→ {line}</p>',
                         unsafe_allow_html=True)
@@ -399,11 +406,10 @@ st.markdown("""
 # ── Tabs ─────────────────────────────────────────────────────────────────────
 
 q = counts()
-tab_kyc, tab_bulk, tab_queue, tab_telemetry = st.tabs([
-    "🔐 KYC Pipeline",
-    "📦 Bulk Import Stress Test",
-    f"🧑‍⚖️ Review Queue ({q['pending']})",
-    "⚡ ROCm Telemetry",
+tab_kyc, tab_queue, tab_telemetry = st.tabs([
+    "KYC Pipeline",
+    f"Review Queue ({q['pending']})",
+    "ROCm Telemetry",
 ])
 
 
@@ -473,7 +479,7 @@ with tab_kyc:
         sof     = st.text_input("Source of Funds")
         purpose = st.text_input("Account Purpose")
 
-        run_btn = st.button("🚀 Run KYC", type="primary", use_container_width=True)
+        run_btn = st.button("Run KYC", type="primary", use_container_width=True)
 
     # Right: results panel
     with col_results:
@@ -499,7 +505,7 @@ with tab_kyc:
                 prior = pre[1] or {}
                 st.session_state.case_result = None
                 st.info(
-                    f"✅ **Applicant already registered and accepted.** "
+                    f"**Applicant already registered and accepted.** "
                     f"{name} (DOB {dob}) was onboarded under application number "
                     f"`{prior.get('application_number', 'N/A')}`. No re-processing needed."
                 )
@@ -508,7 +514,7 @@ with tab_kyc:
                 minutes_left = pre[2] if len(pre) > 2 else REAPPLY_COOLDOWN_MINUTES
                 st.session_state.case_result = None
                 st.error(
-                    f"⛔ **A recent application for {name} was rejected.** "
+                    f"**A recent application for {name} was rejected.** "
                     f"Please try again after {minutes_left} minute(s)."
                 )
                 st.stop()
@@ -521,7 +527,7 @@ with tab_kyc:
 
             customer_id    = f"CUST-IN-{datetime.now().strftime('%Y%m%d%H%M%S')}"
             application_no = generate_application_number()
-            st.caption(f"📄 Application number: `{application_no}`")
+            st.caption(f"Application number: `{application_no}`")
             initial = create_initial_state(
                 customer_id        = customer_id,
                 application_number = application_no,
@@ -542,11 +548,11 @@ with tab_kyc:
             if father_name:
                 initial["declared"]["father_name"] = father_name
 
-            st.markdown("**🧠 Agents working — decisions forming live**")
+            st.markdown("**Agents working — decisions forming live**")
             checklist_ph = st.empty()
             result = initial
             seen   = 0
-            with st.spinner("🔍 Agents processing — Extraction → ID Verify → "
+            with st.spinner("Agents processing — Extraction → ID Verify → "
                             "Compliance → Risk..."):
                 # Stream state snapshots so each agent's checklist appears as it
                 # finishes (stream_mode='values' yields the full state per step).
@@ -610,21 +616,21 @@ with tab_kyc:
                     f"{decision_badge(final)}</div>", unsafe_allow_html=True,
                 )
                 st.success(
-                    f"🧑‍⚖️ **Review complete for {cname}** — officer "
+                    f"**Review complete for {cname}** — officer "
                     f"`{hd.get('officer_id','') or 'unknown'}` recorded a "
                     f"**{final.replace('_',' ')}** decision and the case "
                     f"(`{queued_id}`) is now closed"
                     + (f" · {when}" if when else "") + "."
                 )
                 if hd.get("rationale"):
-                    st.caption(f"📝 Officer rationale: {hd['rationale']}")
+                    st.caption(f"Officer rationale: {hd['rationale']}")
 
                 app_no = result.get("application_number", "")
                 if final == Decision.HOLD_FOR_DOCUMENTS:
                     st.info(hold_instruction(app_no))
                 elif final == Decision.APPROVE:
                     st.download_button(
-                        "📥 Download analysis report",
+                        "Download analysis report",
                         data      = build_analysis_report(result, app_no),
                         file_name = f"KYC_Report_{app_no or queued_id}.md",
                         mime      = "text/markdown",
@@ -633,7 +639,7 @@ with tab_kyc:
             elif (result.get("decision") == Decision.REJECT
                   and result.get("routing") == Routing.AUTO_REJECT):
                 st.error(
-                    "⛔ **Application rejected — identity could not be verified.** "
+                    "**Application rejected — identity could not be verified.** "
                     "The submitted Aadhaar does not match the declared details, so "
                     "we cannot establish the applicant's identity. Please re-apply "
                     "with a document whose name, date of birth, PIN and address "
@@ -649,7 +655,7 @@ with tab_kyc:
                 matched = hits[0].get("matched_name", "") if hits else ""
                 src     = hits[0].get("list_source", "") if hits else ""
                 st.error(
-                    "⛔ **REJECTED — confirmed watchlist match.** "
+                    "**REJECTED — confirmed watchlist match.** "
                     + (f"Identity confirmed against **{matched}**"
                        + (f" ({src})" if src else "") + ". " if matched else "")
                     + "Under the PMLA this rejection must be signed off by a "
@@ -661,15 +667,15 @@ with tab_kyc:
                            "regulatory sign-off, not a re-assessment.")
             elif result.get("routing") == Routing.ROUTE_TO_HUMAN:
                 st.warning(
-                    "⚠ **Human review required** — this case was added to the "
+                    "**Human review required** — this case was added to the "
                     f"**Review Queue** tab as `{st.session_state.queued_id}`. "
                     "A compliance officer will approve, reject, or hold it there."
                 )
             else:
-                st.success("✅ **Auto-approved** — no human review needed.")
+                st.success("**Auto-approved** — no human review needed.")
                 app_no = result.get("application_number", "")
                 st.download_button(
-                    "📥 Download analysis report",
+                    "Download analysis report",
                     data      = build_analysis_report(result, app_no),
                     file_name = f"KYC_Report_{app_no or result.get('customer_id','case')}.md",
                     mime      = "text/markdown",
@@ -680,138 +686,12 @@ with tab_kyc:
                     "click **Run KYC** to begin.")
 
 
-# ── Tab 2: bulk import stress test ──────────────────────────────────────────
-
-with tab_bulk:
-    st.subheader("📦 Bulk Import Stress Test")
-    st.markdown(
-        "Simulates 20 simultaneous customer onboarding requests. "
-        "Watch the pipeline auto-approve clean profiles and route "
-        "high-risk cases to the human Review Queue in real time."
-    )
-
-    if not os.path.exists(BULK_DOSSIERS_PATH):
-        st.warning(f"Mock data not found at `{BULK_DOSSIERS_PATH}`.")
-    else:
-        with open(BULK_DOSSIERS_PATH, encoding="utf-8") as f:
-            customers = json.load(f)
-
-        st.info(f"**{len(customers)} customer profiles loaded** — "
-                f"ready to process on AMD MI300X")
-
-        if st.button("🚀 Import All Customers", type="primary", use_container_width=True):
-            st.session_state.bulk_results = []
-            st.session_state.bulk_queued  = 0
-            app_graph = get_graph()
-
-            table_placeholder   = st.empty()
-            summary_placeholder = st.empty()
-
-            approved = review = rejected = processed = queued = 0
-
-            for customer in customers:
-                try:
-                    application_no = generate_application_number()
-                    initial = create_initial_state(
-                        customer_id        = customer.get("customer_id", f"BULK-{processed:03d}"),
-                        application_number = application_no,
-                        name               = customer.get("name", ""),
-                        dob                = customer.get("dob", ""),
-                        nationality        = customer.get("nationality", "Indian"),
-                        address            = customer.get("address", ""),
-                        pin_code           = customer.get("pin_code", ""),
-                        occupation         = customer.get("occupation", "other"),
-                        income             = float(customer.get("income", 0)),
-                        source_of_funds    = customer.get("source_of_funds", ""),
-                        account_purpose    = customer.get("account_purpose", ""),
-                        aadhaar_path       = customer.get("aadhaar_path", ""),
-                        received_at        = datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
-                    )
-                    # Father's-name passthrough — lets the self-correction loop
-                    # resolve bulk profiles that have no Aadhaar image.
-                    if customer.get("father_name"):
-                        initial["declared"]["father_name"] = customer["father_name"]
-
-                    final   = app_graph.invoke(initial)
-                    dec     = final.get("decision",  "REVIEW")
-                    score   = final.get("risk_score", 0.0)
-                    refines = final.get("refine_count", 0)
-
-                    if dec == Decision.APPROVE:
-                        approved += 1
-                        status_icon = "✅ Auto-Approved"
-                    elif dec == Decision.REJECT:
-                        rejected += 1
-                        status_icon = "⛔ Rejected"
-                    else:
-                        review += 1
-                        status_icon = "⚠️ Human Review"
-
-                    # Send every human-routed case to the persistent queue.
-                    if final.get("routing") == Routing.ROUTE_TO_HUMAN:
-                        if enqueue_case(final):
-                            queued += 1
-
-                    st.session_state.bulk_results.append({
-                        "#":            processed + 1,
-                        "App No.":      application_no,
-                        "Name":         customer.get("name", ""),
-                        "Occupation":   customer.get("occupation", ""),
-                        "Income ₹":     f"₹{float(customer.get('income',0)):,.0f}",
-                        "Score":        f"{score:.2f}",
-                        "Self-Correct": "🔄 Yes" if refines > 0 else "—",
-                        "Decision":     status_icon,
-                    })
-
-                except Exception as e:
-                    st.session_state.bulk_results.append({
-                        "#":            processed + 1,
-                        "App No.":      locals().get("application_no", ""),
-                        "Name":         customer.get("name", ""),
-                        "Occupation":   "",
-                        "Income ₹":     "",
-                        "Score":        "—",
-                        "Self-Correct": "—",
-                        "Decision":     f"❌ Error: {str(e)[:40]}",
-                    })
-
-                processed += 1
-
-                df = pd.DataFrame(st.session_state.bulk_results)
-                table_placeholder.dataframe(df, use_container_width=True, hide_index=True)
-
-                with summary_placeholder.container():
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Processed",       processed)
-                    m2.metric("✅ Auto-Approved", approved)
-                    m3.metric("⚠️ Human Review",  review)
-                    m4.metric("⛔ Rejected",      rejected)
-                    m5.metric("Progress",        f"{processed}/{len(customers)}")
-
-            st.session_state.bulk_queued = queued
-            st.balloons()
-            st.success(
-                f"**Bulk import complete** — {approved} auto-approved · "
-                f"{review} routed to human review · {rejected} rejected · "
-                f"processed {processed} cases on AMD MI300X."
-            )
-            st.info(f"🧑‍⚖️ {queued} case(s) added to the **Review Queue** tab "
-                    f"for officer action.")
-
-        elif st.session_state.bulk_results:
-            st.dataframe(
-                pd.DataFrame(st.session_state.bulk_results),
-                use_container_width=True, hide_index=True,
-            )
-
-
-# ── Tab 3: review queue (persistent officer inbox) ──────────────────────────
+# ── Tab 2: review queue (persistent officer inbox) ──────────────────────────
 
 with tab_queue:
-    st.subheader("🧑‍⚖️ Compliance Review Queue")
-    st.caption("Every case the pipeline routes to a human — from a single run "
-               "or the bulk import — lands here. Persisted to disk, so the "
-               "inbox survives restarts.")
+    st.subheader("Compliance Review Queue")
+    st.caption("Every case the pipeline routes to a human lands here. Persisted "
+               "to disk, so the inbox survives restarts.")
 
     # Post-decision flash (survives the st.rerun that refreshes the pending list).
     flash = st.session_state.pop("queue_flash", None)
@@ -819,18 +699,18 @@ with tab_queue:
         if flash["kind"] == "hold":
             st.info(hold_instruction(flash.get("app_no", "")))
         elif flash["kind"] == "approve":
-            st.success(f"✅ **{flash.get('name','Applicant')} approved** and recorded "
+            st.success(f"**{flash.get('name','Applicant')} approved** and recorded "
                        f"in the applicant registry.")
             if flash.get("report"):
                 st.download_button(
-                    "📥 Download analysis report",
+                    "Download analysis report",
                     data      = flash["report"],
                     file_name = f"KYC_Report_{flash.get('app_no','case')}.md",
                     mime      = "text/markdown",
                     key       = "rep_queue_flash",
                 )
         elif flash["kind"] == "reject":
-            st.error(f"⛔ **{flash.get('name','Applicant')} rejected** — recorded in the "
+            st.error(f"**{flash.get('name','Applicant')} rejected** — recorded in the "
                      f"registry; re-application is blocked for "
                      f"{REAPPLY_COOLDOWN_MINUTES} minutes.")
 
@@ -838,70 +718,91 @@ with tab_queue:
     closed  = list_cases(STATUS_CLOSED)
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("⏳ Awaiting Review", len(pending))
-    m2.metric("✅ Decided",          len(closed))
-    m3.metric("📂 Total",            len(pending) + len(closed))
+    m1.metric("Awaiting Review", len(pending))
+    m2.metric("Decided",         len(closed))
+    m3.metric("Total",           len(pending) + len(closed))
+
+    def _finalize(cid, state, officer_id, decision, rationale, override):
+        """Close one case: write officer decision, persist, record, flash."""
+        if not officer_id.strip():
+            st.warning("Enter an Officer ID before recording a decision.")
+            return
+        closed_state = complete_case(state, officer_id, decision, rationale, override)
+        close_case(cid, closed_state)
+        declared = closed_state.get("declared") or {}
+        app_no   = closed_state.get("application_number", "")
+        record_decision(
+            application_number = app_no,
+            customer_id        = cid,
+            name               = declared.get("name", ""),
+            dob                = declared.get("dob", ""),
+            decision           = decision,
+            risk_score         = closed_state.get("risk_score", 0.0),
+            payload            = declared,
+        )
+        if decision == Decision.HOLD_FOR_DOCUMENTS:
+            st.session_state.queue_flash = {"kind": "hold", "app_no": app_no}
+        elif decision == Decision.APPROVE:
+            st.session_state.queue_flash = {
+                "kind": "approve", "app_no": app_no,
+                "name": declared.get("name", ""),
+                "report": build_analysis_report(closed_state, app_no),
+            }
+        else:
+            st.session_state.queue_flash = {
+                "kind": "reject", "app_no": app_no,
+                "name": declared.get("name", ""),
+            }
+        # Leaving the case decided — drop the selection so the list reopens clean.
+        st.session_state.selected_case = None
+        st.rerun()
 
     if not pending:
         st.info("No cases awaiting review. Cases routed to human review will "
                 "appear here automatically.")
     else:
-        st.markdown(f"**{len(pending)} case(s) awaiting review** — one tab each.")
-        # One tab per pending case; clicking a tab shows its full detail + the
-        # officer decision form.
-        tab_labels = [
-            f"{r['summary'].get('name','?')} · "
-            f"{r['summary'].get('decision','')} · "
-            f"risk {float(r['summary'].get('risk_score',0)):.2f}"
-            for r in pending
-        ]
-        case_tabs = st.tabs(tab_labels)
+        st.divider()
+        # Keep the current selection valid; default to the first pending case.
+        pending_ids = [r["customer_id"] for r in pending]
+        if st.session_state.selected_case not in pending_ids:
+            st.session_state.selected_case = pending_ids[0]
 
-        def _finalize(cid, state, officer_id, decision, rationale, override):
-            """Close one case: write officer decision, persist, record, flash."""
-            if not officer_id.strip():
-                st.warning("Enter an Officer ID before recording a decision.")
-                return
-            closed_state = complete_case(state, officer_id, decision, rationale, override)
-            close_case(cid, closed_state)
-            declared = closed_state.get("declared") or {}
-            app_no   = closed_state.get("application_number", "")
-            record_decision(
-                application_number = app_no,
-                customer_id        = cid,
-                name               = declared.get("name", ""),
-                dob                = declared.get("dob", ""),
-                decision           = decision,
-                risk_score         = closed_state.get("risk_score", 0.0),
-                payload            = declared,
-            )
-            if decision == Decision.HOLD_FOR_DOCUMENTS:
-                st.session_state.queue_flash = {"kind": "hold", "app_no": app_no}
-            elif decision == Decision.APPROVE:
-                st.session_state.queue_flash = {
-                    "kind": "approve", "app_no": app_no,
-                    "name": declared.get("name", ""),
-                    "report": build_analysis_report(closed_state, app_no),
-                }
-            else:
-                st.session_state.queue_flash = {
-                    "kind": "reject", "app_no": app_no,
-                    "name": declared.get("name", ""),
-                }
-            st.rerun()
+        col_list, col_detail = st.columns([1, 1.7], gap="large")
 
-        for case_tab, r in zip(case_tabs, pending):
-            with case_tab:
+        # Left: clickable list of pending cases.
+        with col_list:
+            st.markdown(f"**Awaiting review ({len(pending)})**")
+            for r in pending:
                 cid   = r["customer_id"]
-                rec   = get_case(cid)
-                state = rec["state"]
+                summ  = r.get("summary", {})
+                name  = summ.get("name", "?")
+                dec   = (summ.get("decision", "") or "").replace("_", " ")
+                risk  = float(summ.get("risk_score", 0))
+                selected = (cid == st.session_state.selected_case)
+                label = f"{name}  ·  {dec}  ·  risk {risk:.2f}"
+                if st.button(
+                    label,
+                    key=f"sel_{cid}",
+                    use_container_width=True,
+                    type=("primary" if selected else "secondary"),
+                ):
+                    st.session_state.selected_case = cid
+                    st.rerun()
 
+        # Right: full detail + officer decision form for the selected case.
+        with col_detail:
+            cid   = st.session_state.selected_case
+            rec   = get_case(cid)
+            if not rec:
+                st.info("Select a case from the list to review it.")
+            else:
+                state = rec["state"]
                 render_case_evidence(state, show_overlay=False)
 
                 st.divider()
                 st.markdown("#### Officer Decision")
                 app_no = state.get("application_number", "")
-                st.caption(f"📄 Application: `{app_no or 'N/A'}` · Case: `{cid}`")
+                st.caption(f"Application: `{app_no or 'N/A'}` · Case: `{cid}`")
                 officer_id = st.text_input("Officer ID *", value="OFFICER-KYC-001",
                                            key=f"off_{cid}")
                 rationale  = st.text_area("Decision Rationale", height=90,
@@ -909,19 +810,19 @@ with tab_queue:
                 sys_decision = state.get("decision", Decision.REVIEW)
 
                 b1, b2, b3 = st.columns(3)
-                if b1.button("✅ Approve", use_container_width=True, key=f"ap_{cid}"):
+                if b1.button("Approve", use_container_width=True, key=f"ap_{cid}"):
                     _finalize(cid, state, officer_id, Decision.APPROVE, rationale,
                               sys_decision != Decision.APPROVE)
-                if b2.button("🚫 Reject", use_container_width=True, key=f"rj_{cid}"):
+                if b2.button("Reject", use_container_width=True, key=f"rj_{cid}"):
                     _finalize(cid, state, officer_id, Decision.REJECT, rationale,
                               sys_decision != Decision.REJECT)
-                if b3.button("📁 Hold for Documents", use_container_width=True, key=f"hd_{cid}"):
+                if b3.button("Hold for Documents", use_container_width=True, key=f"hd_{cid}"):
                     _finalize(cid, state, officer_id, Decision.HOLD_FOR_DOCUMENTS,
                               rationale, False)
 
     # Decided-cases history
     if closed:
-        with st.expander(f"✅ Decided cases ({len(closed)})", expanded=False):
+        with st.expander(f"Decided cases ({len(closed)})", expanded=False):
             rows = []
             for r in closed:
                 hd = (r.get("state", {}) or {}).get("human_decision", {}) or {}
@@ -936,9 +837,9 @@ with tab_queue:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     if pending or closed:
-        with st.expander("⚙ Queue admin", expanded=False):
+        with st.expander("Queue admin", expanded=False):
             st.caption("Reset the inbox between demo runs.")
-            if st.button("🗑 Clear entire queue"):
+            if st.button("Clear entire queue"):
                 clear_queue()
                 st.rerun()
 

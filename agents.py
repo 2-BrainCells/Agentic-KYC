@@ -751,7 +751,7 @@ def refine_agent(state: KYCState) -> KYCState:
             f"Refinement #{count} — looping back to extraction"
         )],
         "audit_log": [
-            f"{_now()} [Orchestrator] ⚠ AMBIGUOUS match for '{name}' — "
+            f"{_now()} [Orchestrator] AMBIGUOUS match for '{name}' — "
             f"Refinement Request #{count} issued to Extraction Agent. "
             f"Seeking: father_name, place_of_birth. "
             f"Reason: {reason}"
