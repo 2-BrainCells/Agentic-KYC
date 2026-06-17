@@ -116,6 +116,15 @@ BULK_DOSSIERS_PATH  = "./mock_data/bulk_customers.json"
 # queue survives app restarts (Streamlit session state does not).
 REVIEW_QUEUE_PATH   = "./review_queue/queue.json"
 
+# Applicant registry — a small on-disk SQLite DB of every accepted/rejected/held
+# application, keyed by a unique application number. Powers the re-application
+# guard: an already-accepted applicant is told so; a recently-rejected one must
+# wait out the cooldown before retrying.
+APPLICANT_DB_PATH         = "./applicant_registry/applications.db"
+REAPPLY_COOLDOWN_MINUTES  = 10                  # rejected applicant must wait this long
+DOCUMENT_SUBMISSION_EMAIL = "example@example.com"  # where HOLD applicants mail documents
+APPLICATION_NUMBER_PREFIX = "KYC-APP"           # prefix for generated application numbers
+
 # Max allowed gap between declared income and a parsed salary slip before it
 # counts as a discrepancy. 0.25 = ±25%.
 SALARY_MATCH_TOLERANCE = 0.25

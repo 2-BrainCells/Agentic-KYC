@@ -134,7 +134,15 @@ def complete_case(
     """
     Finish a human-routed case. Writes the officer's decision into state and
     runs active_learning_cache_agent to close the case and store the decision.
-    Returns the updated state (final_decision, closed_at, cache_update).
+    Returns the FULL updated state (final_decision, closed_at, cache_update, and
+    everything carried over).
+
+    NOTE: active_learning_cache_agent follows the LangGraph contract and returns
+    ONLY the fields it changes. Because we call it directly here (not through the
+    graph), no automatic state merge happens — so we merge its partial result
+    back over the input state ourselves. Skipping this drops human_decision,
+    declared, risk_score, etc. from the stored closed state (the cause of the
+    blank officer name / "the applicant" in the review banner).
     """
     updated_state = {
         **state,
@@ -146,7 +154,15 @@ def complete_case(
             "reviewed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S IST"),
         }
     }
-    return active_learning_cache_agent(updated_state)
+    cache_result = active_learning_cache_agent(updated_state)
+
+    merged = {**updated_state, **cache_result}
+    # audit_log uses an add-reducer inside the graph; outside it we concatenate
+    # by hand so the cache agent's line is appended, not replaced.
+    merged["audit_log"] = (
+        updated_state.get("audit_log", []) + cache_result.get("audit_log", [])
+    )
+    return merged
 
 
 # ── Sanity check — run this file directly to exercise the full pipeline ─────

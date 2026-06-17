@@ -45,7 +45,6 @@ from tools import (
     parse_salary_slip,
     compute_field_confidence,
     query_sanctions_db,
-    check_exception_cache,
     setup_sanctions_collection,
 )
 
@@ -555,42 +554,24 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
     """
     Screen the customer name against the watchlists.
 
-    1. Exception cache — a prior officer decision short-circuits to CLEAR.
-    2. Qdrant search (with fallbacks) over name variants.
-    3. Adjust each raw match: DOB gate, then father's-name resolution.
-    4. Status from the best adjusted score: < 0.60 CLEAR · 0.60–0.85 AMBIGUOUS
+    1. Qdrant search (with fallbacks) over name variants.
+    2. Adjust each raw match: DOB gate, then father's-name resolution.
+    3. Status from the best adjusted score: < 0.60 CLEAR · 0.60–0.85 AMBIGUOUS
        (arms the loop when no father's name and retries remain) · > 0.85 hit.
        PEP entries are capped at POTENTIAL_MATCH (EDD, never auto-reject).
+
+    Screening ALWAYS runs to completion — every applicant is freshly screened on
+    every pass. Re-application dedup / cooldown is now owned by the applicant
+    registry at intake (applicant_registry.py), not by a compliance short-circuit.
+    (A prior-decision short-circuit used to surface a stale REJECT as CLEAR and
+    skip the self-correction loop — e.g. Arjun Mehta re-running as REVIEW.)
     """
     extracted = state.get("extracted", {})
     declared  = state.get("declared", {})
     name      = extracted.get("full_name_english") or declared.get("name", "")
     dob       = extracted.get("dob") or declared.get("dob", "")
 
-    # Step 1: exception cache
-    cache_hit = check_exception_cache(name, dob)
-    if cache_hit:
-        return {
-            "compliance_hits":   [],
-            "screening_status":  ScreeningStatus.CLEAR,
-            "refinement_needed": False,
-            "cache_hit":         cache_hit,
-            "case_status":       CaseStatus.SCREENING,
-            "agent_checklists": [_checklist(
-                "Compliance Screening", "🛡️", [
-                    _step("Human exception cache", "pass",
-                          f"prior officer decision found: {cache_hit.get('decision')}"),
-                    _step("Re-screening skipped", "info",
-                          "cached decision reused"),
-                ], "CLEAR (from exception cache)"
-            )],
-            "audit_log": [
-                f"{_now()} [Compliance] CACHE HIT — prior officer decision "
-                f"found: '{cache_hit.get('decision')}'. Skipping re-screen."
-            ],
-        }
-
-    # Step 2: build name variants and search
+    # Step 1: build name variants and search
     devanagari = extracted.get("full_name_devanagari", "")
     name_variants = list(filter(None, [
         name,
@@ -601,7 +582,7 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
 
     hits = query_sanctions_db(name, name_variants)
 
-    # Step 3: adjust each raw match with identity signals
+    # Step 2: adjust each raw match with identity signals
     father    = extracted.get("father_name")
     cust_year = _dob_year(dob)
     notes     = []
@@ -629,7 +610,7 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
             if hit.get("father_resolution"):
                 notes.append(f"'{hit.get('matched_name')}': {hit['father_resolution']}")
 
-    # Step 4: screening status from the best adjusted match
+    # Step 3: screening status from the best adjusted match
     hits.sort(key=lambda h: h.get("match_score", 0), reverse=True)
     best_score = hits[0]["match_score"] if hits else 0.0
     best_hit   = hits[0] if hits else {}
@@ -677,7 +658,8 @@ def compliance_screening_agent(state: KYCState) -> KYCState:
     }.get(status, "info")
 
     steps = [
-        _step("Exception cache checked", "pass", "no prior decision"),
+        _step("Fresh screening (no short-circuit)", "pass",
+              "every applicant fully screened"),
         _step(f"Screened across {len(WATCHLISTS)} watchlists", "pass",
               f"{len(hits)} candidate match(es)"),
         _step("Best match score", status_state,

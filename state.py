@@ -105,6 +105,7 @@ class KYCState(TypedDict, total=False):
 
     # Stage 0 — Customer intake (written by intake, read by all)
     customer_id: str             # e.g. "CUST-IN-2024-001"
+    application_number: str      # unique per submission, e.g. "KYC-APP-20260617094131-a1b"
     declared: dict               # the customer's web-form data (name, dob, income ₹, …)
     documents: dict              # uploaded file paths (aadhaar_card, aadhaar_back, pan_card, salary_slip)
     received_at: str             # ISO timestamp
@@ -183,9 +184,10 @@ def create_initial_state(
     account_purpose: str,
     aadhaar_path: str,
     received_at: str,
-    pan_path: str          = "",   # optional, backward compatible
-    aadhaar_back_path: str = "",   # back / address-QR side of the Aadhaar card
-    salary_slip_path: str  = "",   # optional income proof, verified by financial agent
+    pan_path: str            = "",   # optional, backward compatible
+    aadhaar_back_path: str   = "",   # back / address-QR side of the Aadhaar card
+    salary_slip_path: str    = "",   # optional income proof, verified by financial agent
+    application_number: str  = "",   # unique application number (set by the UI on submit)
 ) -> KYCState:
     """
     Build the starting KYCState from the customer's submitted form data.
@@ -194,10 +196,11 @@ def create_initial_state(
     to the compiled graph's invoke().
     """
     return KYCState(
-        customer_id  = customer_id,
-        received_at  = received_at,
-        case_status  = CaseStatus.RECEIVED,
-        refine_count = 0,
+        customer_id        = customer_id,
+        application_number = application_number,
+        received_at        = received_at,
+        case_status        = CaseStatus.RECEIVED,
+        refine_count       = 0,
 
         declared = {
             "name"           : name,
@@ -219,8 +222,9 @@ def create_initial_state(
         },
 
         audit_log = [
-            f"{received_at} [Intake] {customer_id} received — "
-            f"Aadhaar + PAN, ₹{income:,.0f} declared income"
+            f"{received_at} [Intake] {customer_id} received"
+            + (f" (App {application_number})" if application_number else "")
+            + f" — Aadhaar + PAN, ₹{income:,.0f} declared income"
         ],
     )
 
