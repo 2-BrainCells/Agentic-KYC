@@ -17,6 +17,10 @@ import requests
 from datetime import datetime
 from collections import deque
 
+from config import (
+    GPU_TOTAL_VRAM_GB, GPU_MEMORY_UTILIZATION, VRAM_BUDGET_GB,
+)
+
 VLLM_METRICS_URL = "http://localhost:8000/metrics"   # change port if needed
 HISTORY_POINTS   = 30                                 # tokens/sec rate window
 
@@ -176,20 +180,32 @@ def _render_telemetry_body(st):
               help="Requests waiting — rises under concurrent load")
     st.divider()
 
-    # Row 2: VRAM bar
-    st.markdown("### VRAM Utilisation (192 GB HBM3)")
+    # Row 2: GPU memory footprint — framed as "how little of the card we claim".
+    # The platform is pinned to VRAM_BUDGET_GB via --gpu-memory-utilization, so
+    # the headline bar shows that small slice against the full 192 GB card.
+    st.markdown("### GPU Memory Footprint")
+    footprint_frac = min(VRAM_BUDGET_GB / GPU_TOTAL_VRAM_GB, 1.0)
     col_bar, col_num = st.columns([4, 1])
-    vram_fraction = min(vram["pct"] / 100, 1.0)
-    col_bar.progress(vram_fraction,
-                     text=f"{vram['used_gb']} GB used  /  {vram['total_gb']} GB total")
-    col_num.metric("VRAM %", f"{vram['pct']}%")
+    col_bar.progress(
+        footprint_frac,
+        text=f"{VRAM_BUDGET_GB} GB allocated  /  {GPU_TOTAL_VRAM_GB} GB MI300X",
+    )
+    col_num.metric("Card Claimed", f"{footprint_frac * 100:.0f}%")
 
-    if vram["pct"] > 85:
-        st.warning("VRAM usage high — consider reducing batch size")
-    elif vram["pct"] > 50:
-        st.info("VRAM at moderate utilisation")
-    else:
-        st.success("VRAM healthy")
+    st.caption(
+        f"Capped at {VRAM_BUDGET_GB} GB — {GPU_MEMORY_UTILIZATION * 100:.0f}% of "
+        f"the {GPU_TOTAL_VRAM_GB} GB MI300X (`--gpu-memory-utilization "
+        f"{GPU_MEMORY_UTILIZATION}`). Llama-3-8B weights (~16 GB) plus a bounded "
+        f"KV-cache pool fit inside this, so the platform runs on far smaller GPUs "
+        f"and leaves the rest of the card free for other workloads."
+    )
+
+    # Live confirmation that real usage stays within the cap (rocm-smi).
+    if vram["ok"]:
+        within = vram["used_gb"] <= VRAM_BUDGET_GB + 1   # small tolerance
+        live = (f"Live VRAM in use (rocm-smi): {vram['used_gb']} GB of the "
+                f"{VRAM_BUDGET_GB} GB cap")
+        st.success(live) if within else st.warning(live + " — over budget")
     st.divider()
 
     # Row 3: inference detail
@@ -205,7 +221,7 @@ def _render_telemetry_body(st):
 
     # Hardware badge
     st.markdown(
-        """
+        f"""
         <div style='background:#1a1a2e;padding:12px 20px;border-radius:8px;
                     border-left:4px solid #e84040;margin-top:8px'>
             <span style='color:#e84040;font-weight:bold'>AMD ROCm Stack</span>
@@ -214,7 +230,7 @@ def _render_telemetry_body(st):
             <span style='color:#aaa'> &nbsp;|&nbsp; </span>
             <span style='color:#fff'>Continuous Batching + PagedAttention</span>
             <span style='color:#aaa'> &nbsp;|&nbsp; </span>
-            <span style='color:#fff'>MI300X 192 GB HBM3</span>
+            <span style='color:#fff'>Capped at {VRAM_BUDGET_GB} GB of MI300X 192 GB HBM3</span>
         </div>
         """,
         unsafe_allow_html=True

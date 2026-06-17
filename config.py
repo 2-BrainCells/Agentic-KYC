@@ -37,6 +37,22 @@ VLLM_METRICS_URL    = f"{VLLM_URL}/metrics"
 TELEMETRY_REFRESH_S = 2      # dashboard refresh interval (seconds)
 
 
+# ── GPU memory footprint (the platform is deliberately CAPPED to a slice) ────
+# vLLM otherwise grabs ~90% of the card for its KV-cache pool, which makes it
+# look like the demo "needs" a 192 GB MI300X. We pin it to a small fraction so
+# the whole platform fits on a far smaller/cheaper GPU — and so the telemetry
+# tab tells that efficiency story instead of showing a near-full card.
+#
+# Put these on the `vllm serve` command (see CLAUDE.md §11):
+#   --gpu-memory-utilization {GPU_MEMORY_UTILIZATION} --max-model-len {MAX_MODEL_LEN}
+GPU_TOTAL_VRAM_GB      = 192     # physical MI300X HBM3 (the card we run on)
+GPU_MEMORY_UTILIZATION = 0.20    # vLLM may use AT MOST this fraction of the card
+MAX_MODEL_LEN          = 8192    # context cap — keeps the KV-cache pool small
+# Allocated budget vLLM is pinned to. Llama-3-8B weights (~16 GB bf16) + a
+# bounded KV-cache pool live inside this; the rest of the card stays free.
+VRAM_BUDGET_GB         = round(GPU_TOTAL_VRAM_GB * GPU_MEMORY_UTILIZATION)  # ≈ 38 GB
+
+
 # ── Compliance screening thresholds ────────────────────────────────────────
 # score < 0.60 → CLEAR · 0.60–0.85 → AMBIGUOUS (self-correction) · > 0.85 → hit
 FUZZY_CLEAR_BELOW     = 0.60

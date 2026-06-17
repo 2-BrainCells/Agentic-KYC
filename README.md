@@ -285,7 +285,10 @@ sudo apt-get install -y tesseract-ocr tesseract-ocr-hin
 hf auth login 
 
 # vLLM (separate terminal) — port MUST match config.VLLM_URL
-vllm serve meta-llama/Meta-Llama-3-8B-Instruct --port 8000
+# The two cap flags pin vLLM to ~38 GB (config.VRAM_BUDGET_GB) instead of
+# grabbing ~90% of the card — keeps the GPU footprint small. Tune in config.py.
+vllm serve meta-llama/Meta-Llama-3-8B-Instruct --port 8000 \
+  --gpu-memory-utilization 0.20 --max-model-len 8192
 
 # ingest sanctions — run BEFORE launching the UI. Qdrant runs in embedded
 # local mode (./qdrant_local_db); only ONE process can hold that folder at a
