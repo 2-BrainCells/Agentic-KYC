@@ -1,0 +1,63 @@
+flowchart TD
+    %% ---------- Intake ----------
+    input["Customer Input<br/>Aadhaar + PAN + declared data<br/>(income in INR)"]
+
+    %% ---------- Orchestration ----------
+    subgraph ORCH["Orchestration & Memory Layer"]
+        state["Shared Agent State<br/>(KYCState TypedDict)"]
+        router["Central Orchestrator<br/>(LangGraph routing)"]
+        state <--> router
+    end
+
+    input --> ORCH
+
+    %% ---------- Core pipeline ----------
+    extract["extract<br/>OCR + LLM read Aadhaar"]
+    idverify["id_verify<br/>extracted vs declared"]
+    compliance["compliance<br/>sanctions screening"]
+    refine["refine<br/>Refinement Request<br/>(seek father_name, temp 0.7)"]
+
+    ORCH --> extract
+    extract --> idverify
+    idverify --> compliance
+    compliance -- "AMBIGUOUS<br/>refinement_needed" --> refine
+    refine -- "loop back<br/>(max 1 try)" --> extract
+
+    %% ---------- Parallel fan-out ----------
+    compliance -- "CLEAR / resolved" --> fanout{{fan_out}}
+    entity["entity_resolution<br/>NetworkX MCA21 graph"]
+    financial["financial_profiling<br/>INR bands + anomalies"]
+    fanout --> entity
+    fanout --> financial
+
+    %% ---------- Risk + decision ----------
+    risk["risk<br/>weighted score + LLM explanation"]
+    entity --> risk
+    financial --> risk
+
+    risk -- "score < 0.30<br/>AUTO APPROVE" --> done([END])
+    risk -- "route to human" --> hitl["hitl_review<br/>officer decides in UI"]
+    hitl --> alc["active_learning_cache<br/>store decision"]
+    alc --> done
+
+    %% ---------- Tooling layer ----------
+    subgraph TOOLS["AMD ROCm / Tooling Layer"]
+        vllm["vLLM serving<br/>Llama-3-8B-Instruct"]
+        tess["Tesseract OCR<br/>eng+hin"]
+        qdrant["Qdrant + fastembed<br/>sanctions vectors"]
+        nx["NetworkX<br/>entity graph"]
+        telem["ROCm telemetry<br/>rocm-smi + vLLM /metrics"]
+    end
+
+    extract -.-> tess
+    extract -.-> vllm
+    compliance -.-> qdrant
+    compliance -.-> vllm
+    entity -.-> nx
+    risk -.-> vllm
+
+    %% ---------- Styling ----------
+    classDef loop fill:#ffe2e2,stroke:#c0392b,stroke-width:2px;
+    classDef tool fill:#eef6ff,stroke:#2980b9;
+    class refine loop;
+    class vllm,tess,qdrant,nx,telem tool;

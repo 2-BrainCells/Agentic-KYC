@@ -2,3 +2,6 @@ qdrant_local_db
 .claude
 CLAUDE.md
 .claude\settings.local.json
+code_submission.html
+make_code_pdf.py
+KYC Platform — Code Submission.pdf

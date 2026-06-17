@@ -19,7 +19,8 @@
       "PowerShell($env:PYTHONIOENCODING='utf-8'; python bulk_acceptance_test.py 2>&1 | Select-Object -Last 40)",
       "Bash(PYTHONIOENCODING=utf-8 python *)",
       "Bash(grep -rhoin \"streamlit run[^\\\\\"\\\\\\\\]*\" /c/Users/asus/.claude/projects/D--KYC/*.jsonl)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "PowerShell(pip install *)"
     ]
   }
 }
