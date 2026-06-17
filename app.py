@@ -16,7 +16,6 @@ from datetime import datetime, date
 
 import streamlit as st
 import pandas as pd
-from PIL import Image, ImageDraw
 
 from graph        import build_graph, complete_case
 from state        import create_initial_state, Decision, Routing, CaseStatus
@@ -96,29 +95,6 @@ def save_upload(uploaded_file) -> str:
     with open(path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return path
-
-
-def draw_aadhaar_overlay(image_path, bounding_boxes, low_confidence_fields,
-                         field_confidence):
-    """Draw coloured field boxes on the Aadhaar image (green/amber by confidence)."""
-    try:
-        img  = Image.open(image_path).convert("RGB")
-        draw = ImageDraw.Draw(img)
-        for field, box in bounding_boxes.items():
-            conf = field_confidence.get(field, 0.0)
-            if conf == 0.0:
-                continue
-            if field in low_confidence_fields:
-                color, width = (255, 165, 0), 3
-            elif conf >= 0.90:
-                color, width = (16, 185, 129), 2
-            else:
-                color, width = (245, 158, 11), 2
-            x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-            draw.rectangle([x, y, x + w, y + h], outline=color, width=width)
-        return img
-    except Exception:
-        return None
 
 
 def decision_badge(decision: str) -> str:
@@ -301,7 +277,7 @@ def show_contributing_factors(factors: list) -> None:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
-def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
+def render_case_evidence(result: dict) -> None:
     """
     Render the full decision view for one case state — shared by the Pipeline
     results panel and the Review Queue detail panel.
@@ -346,21 +322,6 @@ def render_case_evidence(result: dict, show_overlay: bool = False) -> None:
 
     st.markdown("**Contributing Factors**")
     show_contributing_factors(result.get("contributing_factors", []))
-
-    if show_overlay:
-        img_path = st.session_state.aadhaar_img_path
-        if img_path and os.path.exists(img_path):
-            st.markdown("**Document Analysis (Aadhaar front)**")
-            overlaid = draw_aadhaar_overlay(
-                img_path,
-                result.get("bounding_boxes",        {}),
-                result.get("low_confidence_fields", []),
-                result.get("field_confidence",      {}),
-            )
-            if overlaid:
-                st.image(overlaid,
-                         caption="Green: high confidence  ·  Amber: medium / low confidence",
-                         width=380)
 
     with st.expander("Full Audit Trail", expanded=False):
         for line in audit_log:
@@ -605,7 +566,7 @@ with tab_kyc:
                     if result.get("final_decision"):
                         result["decision"] = result["final_decision"]
 
-            render_case_evidence(result, show_overlay=True)
+            render_case_evidence(result)
 
             st.divider()
             if closed_rec:
@@ -799,7 +760,7 @@ with tab_queue:
                 st.info("Select a case from the list to review it.")
             else:
                 state = rec["state"]
-                render_case_evidence(state, show_overlay=False)
+                render_case_evidence(state)
 
                 st.divider()
                 st.markdown("#### Officer Decision")
